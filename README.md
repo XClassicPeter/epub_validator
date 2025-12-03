@@ -586,5 +586,5 @@ MIT License - see [LICENSE](LICENSE) file for details.
 
 **Version**: 1.3  
 **Last Updated**: December 3, 2025  
-**Author**: [Your Name]  
-**Repository**: https://github.com/yourusername/epub-validator
+**Author**: XClassicPeter
+**Repository**: https://github.com/XClassicPeter/epub_validator
