@@ -1,0 +1,29 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+env/
+venv/
+.env
+.venv
+
+# Mac
+.DS_Store
+
+# Editor
+.vscode/
+.idea/
+
+# EPUB files (don't commit books)
+*.epub
+
+# Tool output
+*_validation_report.txt
+
+#User data
+Data/
+docs/
+
+
