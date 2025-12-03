@@ -3,24 +3,10 @@
 EPUB Validator - Assess EPUB files for compatibility issues across different readers
 Supports: Standard PC readers, Apple Books, PocketBook, and Kindle
 
-Version: 1.3
+Version: 1.4
 Last Updated: 2025-12-03
 
-CHANGELOG:
-- v1.3: Added NCX/TOC validation, duplicate ID checking, broken link validation
-        Added language metadata validation (required by spec)
-        Added cover image validation with properties check
-        Added spine reference validation
-        Fixed false positives: DOCTYPE entity detection, JavaScript detection
-        Refined inline styles and large image warnings to reduce noise
-        Enhanced all error messages with EPUB spec references
-- v1.2: Added detection of large margin values that break PocketBook layout
-        Enhanced critical summary to include margin layout issues
-        Improved PocketBook compatibility checking
-- v1.1: Fixed false positive detection of text-transform as CSS transform
-        Reduced duplicate entity error reporting
-        Improved accuracy of platform-specific issue detection
-- v1.0: Initial release
+See CHANGELOG.md for version history.
 """
 
 import os
@@ -28,13 +14,29 @@ import sys
 import zipfile
 import xml.etree.ElementTree as ET
 from pathlib import Path
-from typing import Dict, List, Set, Tuple
+from typing import Dict, List, Set, Tuple, Optional
 import re
+import struct
 from collections import defaultdict
 
 
 class EPUBValidator:
     """Validates EPUB files and reports platform-specific issues"""
+    
+    # Security limits
+    MAX_UNCOMPRESSED_SIZE = 500 * 1024 * 1024  # 500MB
+    MAX_COMPRESSION_RATIO = 100
+    
+    # Pre-compiled regex patterns for performance
+    RE_ID_ATTR = re.compile(r'\bid\s*=\s*["\']([^"\']+)["\']', re.IGNORECASE)
+    RE_HREF_ATTR = re.compile(r'href\s*=\s*["\']([^"\']+)["\']', re.IGNORECASE)
+    RE_SCRIPT_TAG = re.compile(r'<script[>\s]', re.IGNORECASE)
+    RE_COMMENT = re.compile(r'<!--.*?-->', re.DOTALL)
+    RE_CSS_COMMENT = re.compile(r'/\*.*?\*/', re.DOTALL)
+    RE_TRANSFORM = re.compile(r'(?<!text-)transform\s*:', re.IGNORECASE)
+    RE_LARGE_MARGIN = re.compile(r'margin[^:]*:\s*(\d+(?:\.\d+)?)(em|rem)', re.IGNORECASE)
+    RE_VIEWPORT_UNITS = re.compile(r'\d+vw|\d+vh|\d+vmin|\d+vmax')
+    RE_BCP47 = re.compile(r'^[a-zA-Z]{2,3}(-[a-zA-Z]{2,4})?(-[a-zA-Z]{4})?(-[a-zA-Z0-9]{2,8})*$')
     
     # Namespaces commonly used in EPUB
     NAMESPACES = {
@@ -76,8 +78,55 @@ class EPUBValidator:
             'image_count': 0,
             'css_count': 0
         }
+        # Cache for file contents to avoid redundant reads
+        self._content_cache: Dict[str, str] = {}
+    
+    def _is_safe_path(self, path: str) -> bool:
+        """Check if path is safe (no directory traversal)"""
+        normalized = os.path.normpath(path)
+        return not normalized.startswith('..') and not os.path.isabs(normalized)
+    
+    def _check_zip_safety(self, epub: zipfile.ZipFile) -> bool:
+        """Check for potential zip bombs"""
+        total_uncompressed = sum(f.file_size for f in epub.infolist())
+        total_compressed = sum(f.compress_size for f in epub.infolist())
         
-    def validate(self) -> Dict:
+        if total_uncompressed > self.MAX_UNCOMPRESSED_SIZE:
+            self.issues['general'].append(
+                f"EPUB uncompressed size ({total_uncompressed / 1024 / 1024:.1f}MB) exceeds safety limit"
+            )
+            return False
+        
+        if total_compressed > 0:
+            ratio = total_uncompressed / total_compressed
+            if ratio > self.MAX_COMPRESSION_RATIO:
+                self.issues['general'].append(
+                    f"Suspicious compression ratio ({ratio:.1f}:1) - possible zip bomb"
+                )
+                return False
+        
+        return True
+    
+    def _read_file_cached(self, epub: zipfile.ZipFile, path: str) -> Optional[str]:
+        """Read file content with caching and safety checks"""
+        if path in self._content_cache:
+            return self._content_cache[path]
+        
+        if not self._is_safe_path(path):
+            self.issues['general'].append(f"Unsafe path detected: '{path}'")
+            return None
+        
+        try:
+            content = epub.read(path).decode('utf-8', errors='ignore')
+            self._content_cache[path] = content
+            return content
+        except KeyError:
+            return None
+        except (IOError, UnicodeDecodeError) as e:
+            self.warnings['general'].append(f"Error reading '{path}': {str(e)}")
+            return None
+        
+    def validate(self) -> Optional[Dict]:
         """Run all validation checks"""
         if not self.epub_path.exists():
             print(f"Error: File '{self.epub_path}' does not exist")
@@ -89,6 +138,10 @@ class EPUBValidator:
         
         try:
             with zipfile.ZipFile(self.epub_path, 'r') as epub:
+                # Security check first
+                if not self._check_zip_safety(epub):
+                    return self._generate_report()
+                
                 # Basic structure checks
                 self._check_mimetype(epub)
                 self._check_container(epub)
@@ -136,18 +189,37 @@ class EPUBValidator:
                 self._check_inkbook_issues(opf_root, manifest)
                 self._check_android_issues(opf_root, manifest)
                 
-        except Exception as e:
+        except (zipfile.BadZipFile, ET.ParseError, IOError, OSError) as e:
             self.issues['general'].append(f"Error processing EPUB: {str(e)}")
+        except Exception as e:
+            # Catch remaining exceptions but don't hide SystemExit/KeyboardInterrupt
+            if isinstance(e, (SystemExit, KeyboardInterrupt)):
+                raise
+            self.issues['general'].append(f"Unexpected error processing EPUB: {str(e)}")
         
         return self._generate_report()
     
     def _check_mimetype(self, epub: zipfile.ZipFile):
-        """Check mimetype file exists and is correct"""
+        """Check mimetype file exists, is correct, and is uncompressed"""
         try:
+            # Check content
             mimetype = epub.read('mimetype').decode('utf-8').strip()
             if mimetype != 'application/epub+zip':
                 self.issues['general'].append(
                     f"Invalid mimetype: '{mimetype}' (should be 'application/epub+zip')"
+                )
+            
+            # Check compression (EPUB OCF spec requires uncompressed)
+            info = epub.getinfo('mimetype')
+            if info.compress_type != zipfile.ZIP_STORED:
+                self.warnings['general'].append(
+                    "Mimetype file is compressed (EPUB OCF 3.0 § 3.3 requires uncompressed)"
+                )
+            
+            # Check if it's the first file (optional but recommended)
+            if epub.namelist()[0] != 'mimetype':
+                self.warnings['general'].append(
+                    "Mimetype is not first file in ZIP (EPUB OCF 3.0 § 3.3 recommends first)"
                 )
         except KeyError:
             self.issues['general'].append("Missing 'mimetype' file")
@@ -159,7 +231,7 @@ class EPUBValidator:
         except KeyError:
             self.issues['general'].append("Missing 'META-INF/container.xml' file")
     
-    def _get_opf_path(self, epub: zipfile.ZipFile) -> str:
+    def _get_opf_path(self, epub: zipfile.ZipFile) -> Optional[str]:
         """Get the path to the OPF file from container.xml"""
         try:
             container_xml = epub.read('META-INF/container.xml').decode('utf-8')
@@ -168,7 +240,7 @@ class EPUBValidator:
             rootfile = container_root.find('.//container:rootfile', self.NAMESPACES)
             if rootfile is not None:
                 return rootfile.get('full-path')
-        except Exception as e:
+        except (KeyError, ET.ParseError, UnicodeDecodeError) as e:
             self.issues['general'].append(f"Error parsing container.xml: {str(e)}")
         
         return None
@@ -195,10 +267,10 @@ class EPUBValidator:
                 )
             else:
                 lang_code = language.text.strip()
-                # Validate BCP 47 format (basic check)
-                if not re.match(r'^[a-z]{2,3}(-[A-Z]{2,4})?(-[a-z]{4})?$', lang_code):
+                # Validate BCP 47 format using pre-compiled pattern
+                if not self.RE_BCP47.match(lang_code):
                     self.warnings['general'].append(
-                        f"Invalid language code '{lang_code}' - should be BCP 47 format (e.g., 'en', 'en-US')"
+                        f"Invalid language code '{lang_code}' - should be BCP 47 format (e.g., 'en', 'en-US', 'zh-Hans')"
                     )
                 self.info['language'] = lang_code
         
@@ -266,41 +338,35 @@ class EPUBValidator:
             if media_type in ['application/xhtml+xml', 'text/html']:
                 xhtml_count += 1
                 
-                try:
-                    content = epub.read(href).decode('utf-8', errors='ignore')
-                    
-                    # Check for HTML entities without proper declaration
-                    self._check_html_entities(content, href)
-                    
-                    # Check for XML/XHTML validity issues
-                    self._check_xhtml_validity(content, href)
-                    
-                    # Check for common issues
-                    # Remove HTML comments first to avoid false positives
-                    content_no_comments = re.sub(r'<!--.*?-->', '', content, flags=re.DOTALL)
-                    if re.search(r'<script[>\s]', content_no_comments, re.IGNORECASE):
-                        self.warnings['general'].append(
-                            f"JavaScript found in '{href}' (limited support on e-readers)"
-                        )
-                    
-                    # Check for embedded styles (warning for Kindle)
-                    # Only warn if extensive inline styles (avoid noise on minimal usage)
-                    inline_style_count = content.count('style=')
-                    if inline_style_count > 10:  # Threshold for concern
-                        self.warnings['kindle'].append(
-                            f"Extensive inline styles ({inline_style_count} instances) in '{href}' "
-                            f"may not render correctly on older Kindles - consider moving to CSS"
-                        )
-                    
-                    # Check for layout issues
-                    self._check_layout_issues(content, href)
-                    
-                except KeyError:
+                content = self._read_file_cached(epub, href)
+                if content is None:
                     self.issues['general'].append(f"Referenced file not found: '{href}'")
-                except Exception as e:
+                    continue
+                
+                # Check for HTML entities without proper declaration
+                self._check_html_entities(content, href)
+                
+                # Check for XML/XHTML validity issues
+                self._check_xhtml_validity(content, href)
+                
+                # Check for common issues using pre-compiled patterns
+                content_no_comments = self.RE_COMMENT.sub('', content)
+                if self.RE_SCRIPT_TAG.search(content_no_comments):
                     self.warnings['general'].append(
-                        f"Error reading '{href}': {str(e)}"
+                        f"JavaScript found in '{href}' (limited support on e-readers)"
                     )
+                
+                # Check for embedded styles (warning for Kindle)
+                # Only warn if extensive inline styles (avoid noise on minimal usage)
+                inline_style_count = content.count('style=')
+                if inline_style_count > 10:  # Threshold for concern
+                    self.warnings['kindle'].append(
+                        f"Extensive inline styles ({inline_style_count} instances) in '{href}' "
+                        f"may not render correctly on older Kindles - consider moving to CSS"
+                    )
+                
+                # Check for layout issues
+                self._check_layout_issues(content, href)
         
         if xhtml_count == 0:
             self.issues['general'].append("No content files found in manifest")
@@ -404,7 +470,7 @@ class EPUBValidator:
             
             # Check for large margin values in inline styles (CRITICAL for PocketBook)
             # Large margins (especially in em units) cause text layout to become mixed/unreadable
-            large_margin_match = re.search(r'margin[^:]*:\s*(\d+(?:\.\d+)?)(em|rem)', line, re.IGNORECASE)
+            large_margin_match = self.RE_LARGE_MARGIN.search(line)
             if large_margin_match:
                 value = float(large_margin_match.group(1))
                 unit = large_margin_match.group(2)
@@ -418,13 +484,13 @@ class EPUBValidator:
                     )
             
             # Check for viewport units
-            if re.search(r'\d+vw|\d+vh|\d+vmin|\d+vmax', line):
+            if self.RE_VIEWPORT_UNITS.search(line):
                 self.warnings['pocketbook'].append(
                     f"{file_path} (line {line_num}): Viewport units may not work correctly"
                 )
             
-            # Check for transforms
-            if 'transform:' in line or 'transform :' in line:
+            # Check for transforms (using pre-compiled pattern)
+            if self.RE_TRANSFORM.search(line):
                 self.warnings['pocketbook'].append(
                     f"{file_path} (line {line_num}): CSS transforms may not be supported"
                 )
@@ -516,24 +582,22 @@ class EPUBValidator:
                             f"Cover image dimensions ({width}x{height}px) too small - "
                             f"recommend minimum 1000x1400px for quality"
                         )
-            except:
-                pass
+            except (KeyError, IOError, struct.error):
+                pass  # Cover file missing or unreadable
         
         # Track which files reference missing images
         if missing_images:
             self._find_image_references(epub, manifest, missing_images)
     
-    def _get_image_dimensions(self, img_data: bytes, media_type: str) -> Tuple:
+    def _get_image_dimensions(self, img_data: bytes, media_type: str) -> Tuple[Optional[int], Optional[int]]:
         """Extract image dimensions from JPEG or PNG data"""
         try:
             if media_type == 'image/png' and len(img_data) > 24:
                 # PNG dimensions are at bytes 16-24
-                import struct
                 width, height = struct.unpack('>II', img_data[16:24])
                 return width, height
             elif media_type == 'image/jpeg':
                 # Basic JPEG dimension extraction
-                import struct
                 i = 0
                 while i < len(img_data) - 9:
                     if img_data[i] == 0xFF:
@@ -541,7 +605,7 @@ class EPUBValidator:
                             height, width = struct.unpack('>HH', img_data[i+5:i+9])
                             return width, height
                     i += 1
-        except:
+        except struct.error:
             pass
         return None, None
     
@@ -549,21 +613,17 @@ class EPUBValidator:
         """Find which XHTML files reference missing images"""
         for item_id, item_info in manifest.items():
             if item_info['media_type'] in ['application/xhtml+xml', 'text/html']:
-                try:
-                    content = epub.read(item_info['href']).decode('utf-8', errors='ignore')
+                content = self._read_file_cached(epub, item_info['href'])
+                if content:
                     for missing_img in missing_images:
                         img_name = missing_img.split('/')[-1]
                         if img_name in content or missing_img in content:
                             self.issues['general'].append(
                                 f"File '{item_info['href']}' references missing image '{missing_img}'"
                             )
-                except:
-                    pass
     
     def _validate_css(self, epub: zipfile.ZipFile, manifest: Dict):
         """Validate CSS files for platform compatibility"""
-        import re
-        
         css_files = [item for item in manifest.values() if item['media_type'] == 'text/css']
         
         for css_file in css_files:
@@ -572,9 +632,8 @@ class EPUBValidator:
                 with epub.open(href) as f:
                     content = f.read().decode('utf-8', errors='ignore')
                     
-                # Remove comments to avoid false positives
-                # This regex handles /* ... */ style comments
-                clean_content = re.sub(r'/\*.*?\*/', '', content, flags=re.DOTALL)
+                # Remove comments using pre-compiled pattern
+                clean_content = self.RE_CSS_COMMENT.sub('', content)
                 
                 lines = content.splitlines() # Keep original for line numbers
                 
@@ -583,12 +642,11 @@ class EPUBValidator:
                 # text-transform: uppercase/lowercase/capitalize - SAFE
                 # transform: rotate/scale/translate - BREAKS RENDERING
                 
-                # Look for transform property but exclude text-transform
-                transform_pattern = re.compile(r'(?<!text-)transform\s*:', re.IGNORECASE)
-                if transform_pattern.search(clean_content):
+                # Look for transform property using pre-compiled pattern
+                if self.RE_TRANSFORM.search(clean_content):
                     for i, line in enumerate(lines, 1):
                         # Check if line is not commented out (simple check)
-                        if transform_pattern.search(line) and not line.strip().startswith('/*'):
+                        if self.RE_TRANSFORM.search(line) and not line.strip().startswith('/*'):
                             msg = f"CSS transform detected (stops rendering on PocketBook/InkBook): {line.strip()[:50]}..."
                             self.issues['pocketbook'].append(f"{href} (line {i}): {msg}")
                             self.issues['inkbook'].append(f"{href} (line {i}): {msg}")
@@ -599,9 +657,8 @@ class EPUBValidator:
                         f"{href}: Absolute positioning detected (may break reflowable layout)"
                     )
                     
-            except Exception as e:
-                self.issues['general'].append(f"Could not parse CSS file '{href}': {str(e)}")
-        
+            except (KeyError, IOError, UnicodeDecodeError) as e:
+                self.issues['general'].append(f"Could not parse CSS file '{href}': {str(e)}")        
         self.info['css_count'] = len(css_files)
     
     def _validate_navigation(self, epub: zipfile.ZipFile, opf_root: ET.Element, manifest: Dict):
@@ -643,21 +700,18 @@ class EPUBValidator:
         
         for item_id, item_info in manifest.items():
             if item_info['media_type'] in ['application/xhtml+xml', 'text/html']:
-                try:
-                    content = epub.read(item_info['href']).decode('utf-8', errors='ignore')
-                    
-                    # Find all id attributes using regex (more reliable than XML parsing for malformed docs)
-                    for match in re.finditer(r'\\bid\\s*=\\s*["\']([^"\']+)["\']', content, re.IGNORECASE):
+                content = self._read_file_cached(epub, item_info['href'])
+                if content:
+                    # Find all id attributes using pre-compiled regex
+                    for match in self.RE_ID_ATTR.finditer(content):
                         elem_id = match.group(1)
                         all_ids[elem_id].append(item_info['href'])
-                except:
-                    pass
         
         # Check for duplicates across files
         for elem_id, files in all_ids.items():
             if len(files) > 1:
                 self.issues['general'].append(
-                    f"Duplicate ID '{elem_id}' found in multiple files: {', '.join(files[:3])}\"{'...' if len(files) > 3 else ''}\" (XML 1.0 \u00a7 3.3.1)"
+                    f"Duplicate ID '{elem_id}' found in multiple files: {', '.join(files[:3])}{'...' if len(files) > 3 else ''} (XML 1.0 \u00a7 3.3.1)"
                 )
     
     def _validate_links(self, epub: zipfile.ZipFile, manifest: Dict):
@@ -665,67 +719,64 @@ class EPUBValidator:
         # Build set of valid files
         valid_files = {item['href'] for item in manifest.values()}
         
-        # Collect all IDs per file
+        # Collect all IDs per file using cached content
         file_ids = defaultdict(set)  # file -> set of IDs
         for item_id, item_info in manifest.items():
             if item_info['media_type'] in ['application/xhtml+xml', 'text/html']:
-                try:
-                    content = epub.read(item_info['href']).decode('utf-8', errors='ignore')
-                    for match in re.finditer(r'\\bid\\s*=\\s*["\']([^"\']+)["\']', content, re.IGNORECASE):
+                content = self._read_file_cached(epub, item_info['href'])
+                if content:
+                    for match in self.RE_ID_ATTR.finditer(content):
                         elem_id = match.group(1)
                         file_ids[item_info['href']].add(elem_id)
-                except:
-                    pass
         
         # Validate links
         for item_id, item_info in manifest.items():
             if item_info['media_type'] in ['application/xhtml+xml', 'text/html']:
-                try:
-                    content = epub.read(item_info['href']).decode('utf-8', errors='ignore')
+                content = self._read_file_cached(epub, item_info['href'])
+                if not content:
+                    continue
+                
+                # Find all href attributes using pre-compiled regex
+                for match in self.RE_HREF_ATTR.finditer(content):
+                    href = match.group(1)
                     
-                    # Find all href attributes
-                    for match in re.finditer(r'href\\s*=\\s*["\']([^"\']+)["\']', content, re.IGNORECASE):
-                        href = match.group(1)
-                        
-                        # Skip external links and pure fragments
-                        if href.startswith(('http://', 'https://', 'mailto:', 'ftp://', 'data:')):
-                            continue
-                        if href.startswith('#'):
-                            # Local fragment - validate against current file IDs
-                            fragment = href[1:]
-                            if fragment and fragment not in file_ids.get(item_info['href'], set()):
-                                self.issues['general'].append(
-                                    f"{item_info['href']}: Broken link to '#{fragment}' (ID not found in same file)"
-                                )
-                            continue
-                        
-                        # Parse file and fragment
-                        if '#' in href:
-                            file_part, fragment = href.split('#', 1)
+                    # Skip external links and pure fragments
+                    if href.startswith(('http://', 'https://', 'mailto:', 'ftp://', 'data:')):
+                        continue
+                    if href.startswith('#'):
+                        # Local fragment - validate against current file IDs
+                        fragment = href[1:]
+                        if fragment and fragment not in file_ids.get(item_info['href'], set()):
+                            self.issues['general'].append(
+                                f"{item_info['href']}: Broken link to '#{fragment}' (ID not found in same file)"
+                            )
+                        continue
+                    
+                    # Parse file and fragment
+                    if '#' in href:
+                        file_part, fragment = href.split('#', 1)
+                    else:
+                        file_part, fragment = href, None
+                    
+                    # Resolve relative path
+                    if file_part:
+                        base_dir = str(Path(item_info['href']).parent)
+                        if base_dir == '.':
+                            target_file = file_part
                         else:
-                            file_part, fragment = href, None
+                            target_file = str((Path(base_dir) / file_part).as_posix())
                         
-                        # Resolve relative path
-                        if file_part:
-                            base_dir = str(Path(item_info['href']).parent)
-                            if base_dir == '.':
-                                target_file = file_part
-                            else:
-                                target_file = str((Path(base_dir) / file_part).as_posix())
-                            
-                            # Normalize path
-                            target_file = target_file.replace('//', '/')
-                            
-                            if target_file not in valid_files:
-                                self.issues['general'].append(
-                                    f"{item_info['href']}: Broken link to '{href}' (file not found in manifest)"
-                                )
-                            elif fragment and fragment not in file_ids.get(target_file, set()):
-                                self.warnings['general'].append(
-                                    f"{item_info['href']}: Link to '{href}' - fragment ID '{fragment}' not found in target"
-                                )
-                except:
-                    pass
+                        # Normalize path
+                        target_file = target_file.replace('//', '/')
+                        
+                        if target_file not in valid_files:
+                            self.issues['general'].append(
+                                f"{item_info['href']}: Broken link to '{href}' (file not found in manifest)"
+                            )
+                        elif fragment and fragment not in file_ids.get(target_file, set()):
+                            self.warnings['general'].append(
+                                f"{item_info['href']}: Link to '{href}' - fragment ID '{fragment}' not found in target"
+                            )
     
     def _validate_fonts(self, epub: zipfile.ZipFile, manifest: Dict):
         """Validate embedded fonts"""
@@ -936,27 +987,27 @@ class EPUBValidator:
     def _check_kindle_issues(self, opf_root: ET.Element, manifest: Dict, spine: List):
         """Check for Kindle specific issues"""
         # Kindle has the most restrictions
+        # Note: EPUB format requires conversion to MOBI/AZW3 for Kindle
+        # We don't add a blanket "requires conversion" message as it's noise for every EPUB
         
-        # Note: EPUB 3 is acceptable, Kindle can handle it with conversion
-        
-        # Check for audio/video
+        # Check for audio/video (not supported even after conversion)
         media_types = ['audio/mpeg', 'audio/mp4', 'video/mp4', 'video/h264']
+        has_media = False
         for item_id, item_info in manifest.items():
             if item_info['media_type'] in media_types:
+                has_media = True
                 self.issues['kindle'].append(
-                    f"Audio/Video content '{item_info['href']}' not supported on Kindle (requires conversion)"
+                    f"Audio/Video content '{item_info['href']}' not supported on Kindle"
                 )
         
-        # Check for complex tables
-        # Would require parsing XHTML - adding as general note
-        self.warnings['kindle'].append(
-            "Complex tables may not render well - verify after conversion to MOBI/AZW3"
-        )
-        
-        # Kindle doesn't support EPUBs directly
-        self.issues['kindle'].append(
-            "Kindle devices require conversion from EPUB to MOBI/AZW3 format"
-        )
+        # Only add table warning if there's actual content (avoid noise)
+        # Check for MathML which definitely doesn't work well
+        for item_id, item_info in manifest.items():
+            properties = item_info.get('properties', '')
+            if 'mathml' in properties.lower():
+                self.issues['kindle'].append(
+                    "MathML content not supported on Kindle devices"
+                )
     
     def _generate_report(self) -> Dict:
         """Generate final validation report"""
