@@ -2,7 +2,7 @@
 
 A comprehensive EPUB validation tool that checks e-book files for compatibility issues across different reading platforms and devices.
 
-[![Version](https://img.shields.io/badge/version-1.3-blue.svg)](https://github.com/yourusername/epub-validator)
+[![Version](https://img.shields.io/badge/version-1.3-blue.svg)](https://github.com/XClassicPeter/epub_validator)
 [![Python](https://img.shields.io/badge/python-3.7+-green.svg)](https://www.python.org/)
 [![License](https://img.shields.io/badge/license-MIT-orange.svg)](LICENSE)
 
@@ -43,8 +43,8 @@ A comprehensive EPUB validation tool that checks e-book files for compatibility 
 
 ```bash
 # Clone the repository
-git clone https://github.com/yourusername/epub-validator.git
-cd epub-validator
+git clone https://github.com/XClassicPeter/epub_validator.git
+cd epub_validator
 
 # Make executable (optional)
 chmod +x epub_validator.py
@@ -586,5 +586,5 @@ MIT License - see [LICENSE](LICENSE) file for details.
 
 **Version**: 1.3  
 **Last Updated**: December 3, 2025  
-**Author**: XClassicPeter
+**Author**: XClassicPeter  
 **Repository**: https://github.com/XClassicPeter/epub_validator
