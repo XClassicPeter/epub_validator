@@ -579,8 +579,8 @@ MIT License - see [LICENSE](LICENSE) file for details.
 
 ### Validators
 
-- [EPUBCheck Online](https://www.pagina.gmbh/produkte/epub-checker/) - Official validator
-- [Ace by DAISY](https://inclusivepublishing.org/toolbox/accessibility-checker/) - Accessibility checker
+- [EPUBCheck](https://github.com/w3c/epubcheck) - Official W3C EPUB validator (command-line tool)
+- [Ace by DAISY](https://daisy.org/activities/software/ace/) - Accessibility checker
 
 ---
 
