@@ -15,6 +15,7 @@ import zipfile
 import xml.etree.ElementTree as ET
 from pathlib import Path
 from typing import Dict, List, Set, Tuple, Optional
+from urllib.parse import unquote
 import re
 import struct
 from collections import defaultdict
@@ -52,6 +53,8 @@ class EPUBValidator:
     RE_CSS_CAPTION_SIDE = re.compile(r'caption-side\s*:\s*bottom', re.IGNORECASE)
     RE_CSS_BODY_FONT_OVERRIDE = re.compile(r'body\s*\{[^}]*font-family\s*:', re.IGNORECASE | re.DOTALL)
     RE_NBSP_EXCESSIVE = re.compile(r'(?:&nbsp;|&#160;)\s*(?:&nbsp;|&#160;)\s*(?:&nbsp;|&#160;)', re.IGNORECASE)
+    RE_LANG_ATTR = re.compile(r'\blang\s*=\s*["\']([^"\']+)["\']', re.IGNORECASE)
+    RE_HTML_ROOT_LANG = re.compile(r'<html[^>]*\bxml:lang\s*=\s*["\']([^"\']+)["\']', re.IGNORECASE)
     RE_CSS_COLOR_FORCE = re.compile(r'(?<![a-zA-Z-])color\s*:\s*(?:#[0-9a-fA-F]{3,6}|rgb)', re.IGNORECASE)
     RE_CSS_BODY_BOLD = re.compile(r'body\s*\{[^}]*font-weight\s*:\s*bold', re.IGNORECASE | re.DOTALL)
     RE_CSS_BODY_ITALIC = re.compile(r'body\s*\{[^}]*font-style\s*:\s*italic', re.IGNORECASE | re.DOTALL)
@@ -199,6 +202,9 @@ class EPUBValidator:
                 self._validate_ids(epub, manifest)
                 self._validate_links(epub, manifest)
                 
+                # Structural quality checks
+                self._check_content_structure(epub, manifest)
+
                 # Platform-specific checks
                 self._check_pc_reader_issues(opf_root, manifest)
                 self._check_apple_books_issues(opf_root, manifest)
@@ -278,25 +284,52 @@ class EPUBValidator:
             if creator is not None and creator.text:
                 self.info['author'] = creator.text
             
-            # Language (REQUIRED by EPUB spec)
-            language = metadata.find('.//dc:language', self.NAMESPACES)
-            if language is None or not language.text:
+            # Language (REQUIRED by EPUB spec) - read ALL dc:language entries
+            all_languages = metadata.findall('.//dc:language', self.NAMESPACES)
+            if not all_languages or not any(l.text and l.text.strip() for l in all_languages):
                 self.issues['general'].append(
                     "Missing dc:language metadata (REQUIRED by EPUB specification - EPUB 3.3 § 4.2.2)"
                 )
             else:
-                lang_code = language.text.strip()
-                # Validate BCP 47 format using pre-compiled pattern
-                if not self.RE_BCP47.match(lang_code):
-                    self.warnings['general'].append(
-                        f"Invalid language code '{lang_code}' - should be BCP 47 format (e.g., 'en', 'en-US', 'zh-Hans')"
-                    )
-                self.info['language'] = lang_code
+                lang_codes = []
+                for lang_elem in all_languages:
+                    if lang_elem.text and lang_elem.text.strip():
+                        lang_code = lang_elem.text.strip()
+                        lang_codes.append(lang_code)
+                        # Validate BCP 47 format
+                        if not self.RE_BCP47.match(lang_code):
+                            self.warnings['general'].append(
+                                f"Invalid language code '{lang_code}' - should be BCP 47 format (e.g., 'en', 'en-US', 'zh-Hans')"
+                            )
+
+                # Store all languages and the primary (first) one
+                self.info['language'] = lang_codes[0] if lang_codes else None
+                self.info['all_languages'] = lang_codes
+
+                # Flag if multiple languages have conflicting primary codes
+                if len(lang_codes) > 1:
+                    primary_codes = set(lc.split('-')[0].lower() for lc in lang_codes)
+                    if len(primary_codes) > 1:
+                        self.warnings['general'].append(
+                            f"Multiple conflicting dc:language entries: {', '.join(lang_codes)} - "
+                            f"verify the primary language is listed first"
+                        )
 
             # Identifier
             identifier = metadata.find('.//dc:identifier', self.NAMESPACES)
             if identifier is not None and identifier.text:
                 self.info['identifier'] = identifier.text.strip()
+
+            # Check for placeholder metadata values
+            placeholder_re = re.compile(r'^[A-Z_]{5,}$|^(YOUR|TODO|FIXME|INSERT|PLACEHOLDER|CHANGE)', re.IGNORECASE)
+            for tag_name in ['dc:source', 'dc:identifier', 'dc:publisher', 'dc:rights']:
+                for elem in metadata.findall(f'.//{tag_name}', self.NAMESPACES):
+                    if elem.text and elem.text.strip():
+                        text = elem.text.strip()
+                        if placeholder_re.search(text):
+                            self.warnings['general'].append(
+                                f"Possible placeholder in {tag_name}: '{text}' - replace with actual value before publishing"
+                            )
 
         # EPUB version
         package = opf_root
@@ -317,11 +350,15 @@ class EPUBValidator:
                 properties = item.get('properties', '')
                 
                 if href:
+                    # URL-decode the href (manifest uses IRI/percent-encoding,
+                    # but ZIP entry names use decoded filenames)
+                    decoded_href = unquote(href)
+
                     # Resolve path relative to OPF
                     if opf_dir and opf_dir != '.':
-                        full_path = str(Path(opf_dir) / href)
+                        full_path = str(Path(opf_dir) / decoded_href)
                     else:
-                        full_path = href
+                        full_path = decoded_href
                     
                     manifest[item_id] = {
                         'href': full_path,
@@ -391,7 +428,10 @@ class EPUBValidator:
                 
                 # Check for layout issues
                 self._check_layout_issues(content, href)
-        
+
+                # Check for language attribute mismatches
+                self._check_language_attrs(content, href)
+
         if xhtml_count == 0:
             self.issues['general'].append("No content files found in manifest")
     
@@ -519,6 +559,42 @@ class EPUBValidator:
                     f"{file_path} (line {line_num}): CSS transforms may not be supported"
                 )
     
+    def _check_language_attrs(self, content: str, file_path: str):
+        """Check for language attribute mismatches in content elements"""
+        declared_langs = self.info.get('all_languages', [])
+        if not declared_langs:
+            return
+
+        # Get the primary language codes (without region) from declared languages
+        declared_primary = set(lc.split('-')[0].lower() for lc in declared_langs)
+
+        # Check the html root element's xml:lang
+        root_match = self.RE_HTML_ROOT_LANG.search(content)
+        if root_match:
+            root_lang = root_match.group(1)
+            root_primary = root_lang.split('-')[0].lower()
+            if root_primary not in declared_primary:
+                self.warnings['general'].append(
+                    f"{file_path}: html xml:lang='{root_lang}' does not match "
+                    f"any declared dc:language ({', '.join(declared_langs)})"
+                )
+
+        # Check for lang attributes on inner elements that mismatch
+        # Only flag languages that don't match ANY declared language
+        mismatched_langs = {}
+        for match in self.RE_LANG_ATTR.finditer(content):
+            lang_val = match.group(1)
+            lang_primary = lang_val.split('-')[0].lower()
+            # Skip if it matches any declared language
+            if lang_primary not in declared_primary:
+                mismatched_langs[lang_val] = mismatched_langs.get(lang_val, 0) + 1
+
+        for lang_val, count in mismatched_langs.items():
+            self.warnings['general'].append(
+                f"{file_path}: {count} element(s) use lang='{lang_val}' which doesn't match "
+                f"declared dc:language ({', '.join(declared_langs)}) - may affect TTS and spell-checking"
+            )
+
     def _validate_images(self, epub: zipfile.ZipFile, manifest: Dict):
         """Validate images and check formats"""
         image_types = ['image/jpeg', 'image/png', 'image/gif', 'image/svg+xml']
@@ -680,9 +756,43 @@ class EPUBValidator:
                     self.warnings['general'].append(
                         f"{href}: Absolute positioning detected (may break reflowable layout)"
                     )
-                    
+
+                # Check for invalid CSS element selectors (not valid HTML elements)
+                # Only inspect selector portions (text before '{'), not properties inside blocks
+                VALID_HTML_ELEMENTS = {
+                    'a', 'abbr', 'address', 'area', 'article', 'aside', 'audio',
+                    'b', 'base', 'bdi', 'bdo', 'blockquote', 'body', 'br', 'button',
+                    'canvas', 'caption', 'cite', 'code', 'col', 'colgroup',
+                    'data', 'datalist', 'dd', 'del', 'details', 'dfn', 'dialog', 'div', 'dl', 'dt',
+                    'em', 'embed', 'fieldset', 'figcaption', 'figure', 'footer', 'form',
+                    'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'head', 'header', 'hgroup', 'hr', 'html',
+                    'i', 'iframe', 'img', 'input', 'ins', 'kbd',
+                    'label', 'legend', 'li', 'link', 'main', 'map', 'mark', 'math', 'menu', 'meta',
+                    'meter', 'nav', 'noscript', 'object', 'ol', 'optgroup', 'option', 'output',
+                    'p', 'param', 'picture', 'pre', 'progress', 'q',
+                    'rp', 'rt', 'ruby', 's', 'samp', 'script', 'search', 'section', 'select', 'slot',
+                    'small', 'source', 'span', 'strong', 'style', 'sub', 'summary', 'sup', 'svg',
+                    'table', 'tbody', 'td', 'template', 'textarea', 'tfoot', 'th', 'thead',
+                    'time', 'title', 'tr', 'track', 'u', 'ul', 'var', 'video', 'wbr',
+                }
+                invalid_selectors = set()
+                bare_element_re = re.compile(r'(?:^|[,\s>+~])([a-zA-Z][a-zA-Z0-9]*)(?=\s*[{,.#:\[>+~ ]|$)')
+                # Split on '{' and inspect only selector parts (text after last '}')
+                for block in clean_content.split('{'):
+                    selector_part = block.rsplit('}', 1)[-1].strip()
+                    if not selector_part or selector_part.startswith('@'):
+                        continue
+                    for match in bare_element_re.finditer(selector_part):
+                        candidate = match.group(1).lower()
+                        if candidate not in VALID_HTML_ELEMENTS:
+                            invalid_selectors.add(candidate)
+                for selector in sorted(invalid_selectors):
+                    self.warnings['general'].append(
+                        f"{href}: CSS targets non-existent HTML element '{selector}' - likely a typo"
+                    )
+
             except (KeyError, IOError, UnicodeDecodeError) as e:
-                self.issues['general'].append(f"Could not parse CSS file '{href}': {str(e)}")        
+                self.issues['general'].append(f"Could not parse CSS file '{href}': {str(e)}")
         self.info['css_count'] = len(css_files)
     
     def _validate_navigation(self, epub: zipfile.ZipFile, opf_root: ET.Element, manifest: Dict):
@@ -760,10 +870,17 @@ class EPUBValidator:
                 if not content:
                     continue
                 
+                # Detect empty href attributes (href="" or href='')
+                empty_href_count = len(re.findall(r'href\s*=\s*["\']["\']', content, re.IGNORECASE))
+                if empty_href_count > 0:
+                    self.warnings['general'].append(
+                        f"{item_info['href']}: {empty_href_count} empty href='' attribute(s) (broken or placeholder link)"
+                    )
+
                 # Find all href attributes using pre-compiled regex
                 for match in self.RE_HREF_ATTR.finditer(content):
                     href = match.group(1)
-                    
+
                     # Skip external links and pure fragments
                     if href.startswith(('http://', 'https://', 'mailto:', 'ftp://', 'data:')):
                         continue
@@ -802,6 +919,30 @@ class EPUBValidator:
                                 f"{item_info['href']}: Link to '{href}' - fragment ID '{fragment}' not found in target"
                             )
     
+    def _check_content_structure(self, epub: zipfile.ZipFile, manifest: Dict):
+        """Check content file structure for performance and navigation issues"""
+        content_files = []
+        for item_id, item_info in manifest.items():
+            if item_info['media_type'] in ('application/xhtml+xml', 'text/html'):
+                try:
+                    info = epub.getinfo(item_info['href'])
+                    content_files.append((item_info['href'], info.file_size))
+                except KeyError:
+                    pass
+
+        if not content_files:
+            return
+
+        total_content_size = sum(s for _, s in content_files)
+
+        # Check for single large file containing most of the content
+        for href, size in content_files:
+            if size > 150 * 1024 and (len(content_files) <= 3 or size > total_content_size * 0.8):
+                self.warnings['general'].append(
+                    f"Very large content file '{href}' ({size / 1024:.0f}KB) - "
+                    f"splitting into chapters improves reader performance and navigation"
+                )
+
     def _validate_fonts(self, epub: zipfile.ZipFile, manifest: Dict):
         """Validate embedded fonts"""
         font_types = [
@@ -834,14 +975,50 @@ class EPUBValidator:
             self.info['font_count'] = font_count
     
     def _check_drm(self, epub: zipfile.ZipFile):
-        """Check for DRM indicators"""
+        """Check for DRM indicators, distinguishing font obfuscation from actual DRM"""
+        # Font obfuscation algorithms (NOT DRM)
+        FONT_OBFUSCATION_ALGORITHMS = {
+            'http://www.idpf.org/2008/embedding',       # IDPF font obfuscation
+            'http://ns.adobe.com/pdf/enc#RC',            # Adobe font mangling
+        }
+
         try:
-            # Check for encryption.xml
-            encryption = epub.read('META-INF/encryption.xml').decode('utf-8')
-            if 'encryption' in encryption.lower():
+            encryption_xml = epub.read('META-INF/encryption.xml').decode('utf-8')
+            enc_root = ET.fromstring(encryption_xml)
+
+            ns = {
+                'enc': 'http://www.w3.org/2001/04/xmlenc#',
+                'container': 'urn:oasis:names:tc:opendocument:xmlns:container'
+            }
+
+            encrypted_items = enc_root.findall('.//enc:EncryptedData', ns)
+            font_obfuscated = 0
+            drm_encrypted = 0
+
+            for item in encrypted_items:
+                method = item.find('.//enc:EncryptionMethod', ns)
+                algorithm = method.get('Algorithm', '') if method is not None else ''
+
+                if algorithm in FONT_OBFUSCATION_ALGORITHMS:
+                    font_obfuscated += 1
+                else:
+                    drm_encrypted += 1
+
+            if drm_encrypted > 0:
                 self.issues['general'].append(
-                    "DRM/Encryption detected - may not be readable on all devices"
+                    f"DRM/Encryption detected ({drm_encrypted} encrypted resource(s)) - "
+                    f"may not be readable on all devices"
                 )
+            if font_obfuscated > 0:
+                self.warnings['general'].append(
+                    f"Font obfuscation detected ({font_obfuscated} font(s)) - "
+                    f"standard practice for font licensing compliance, not DRM"
+                )
+
+        except ET.ParseError:
+            self.warnings['general'].append(
+                "Could not parse META-INF/encryption.xml - unable to determine encryption type"
+            )
         except KeyError:
             pass  # No encryption file is normal
     
@@ -971,12 +1148,12 @@ class EPUBValidator:
                     f"SVG image '{href}' may have limited support on InkBook"
                 )
         
-        # Check for complex fonts
+        # Check for fixed layout (pre-paginated only)
         metadata = opf_root.find('.//opf:metadata', self.NAMESPACES)
         if metadata is not None:
             for meta in metadata.findall('.//opf:meta', self.NAMESPACES):
                 property_attr = meta.get('property', '')
-                if 'rendition:layout' in property_attr:
+                if property_attr == 'rendition:layout' and meta.text and meta.text.strip() == 'pre-paginated':
                     self.warnings['inkbook'].append(
                         "Fixed layout may not work correctly on InkBook"
                     )
@@ -1373,6 +1550,23 @@ class EPUBValidator:
                 except (KeyError, IOError):
                     pass
 
+            # CMYK detection for all JPEG images (not just cover)
+            if media_type == 'image/jpeg':
+                try:
+                    img_data = epub.read(href)
+                    if self._is_cmyk_jpeg(img_data):
+                        # Skip cover image (already checked in _kdp_check_cover_image)
+                        cover_items = [item for item in manifest.values()
+                                       if 'cover-image' in item.get('properties', '')]
+                        is_cover = any(c['href'] == href for c in cover_items)
+                        if not is_cover:
+                            self.warnings['kindle'].append(
+                                f"Image '{href}' uses CMYK color space - "
+                                f"KDP converts to sRGB which may shift colors"
+                            )
+                except (KeyError, IOError):
+                    pass
+
         # Check alt text on images in HTML content
         missing_alt_count = 0
         for item_id, item_info in manifest.items():
@@ -1531,6 +1725,308 @@ class EPUBValidator:
         return summary
 
 
+def _print_calibre_guide(report: Dict, log):
+    """Print a contextual Calibre fix guide based on issues found in the report"""
+
+    # Collect all issues and warnings into a single searchable list
+    all_issues = []
+    all_warnings = []
+    for platform in report['issues']:
+        all_issues.extend(report['issues'][platform])
+    for platform in report['warnings']:
+        all_warnings.extend(report['warnings'][platform])
+    all_messages = all_issues + all_warnings
+
+    if not all_messages:
+        return
+
+    all_text = '\n'.join(all_messages).lower()
+
+    # Build the list of applicable fix instructions
+    fixes = []
+
+    # --- Large margins (PocketBook/InkBook) ---
+    if 'large margin value' in all_text:
+        fixes.append((
+            "Large margin values (PocketBook / InkBook)",
+            [
+                "Edit Book (Ctrl+E / Cmd+E) > open the flagged .xhtml file",
+                "Use Edit > Find & Replace (Ctrl+H), set mode to 'Regex'",
+                "Search:  (margin[^:]*:\\s*)(\\d+)(em)  — look at matches with value >= 5",
+                "Replace large values (5em+) with max 2em, e.g. margin-bottom: 2em",
+                "Better: move spacing to the CSS file using a class instead of inline style",
+                "  Example: replace style=\"margin-bottom: 6em\" with class=\"chapter-break\"",
+                "  then in CSS:  .chapter-break { margin-bottom: 2em; page-break-before: always; }",
+            ]
+        ))
+
+    # --- Inline styles ---
+    if 'inline styles' in all_text:
+        fixes.append((
+            "Excessive inline styles (Kindle compatibility)",
+            [
+                "Edit Book > open the flagged .xhtml file",
+                "Identify repeated inline style= attributes",
+                "Create CSS classes in the stylesheet for common patterns:",
+                "  e.g.  .center { text-align: center; }",
+                "Replace inline styles with class references:",
+                "  Before: <p style=\"text-align: center;\">",
+                "  After:  <p class=\"center\">",
+                "Tip: Calibre > Edit Book > Tools > Transform Styles can help",
+            ]
+        ))
+
+    # --- Conflicting / wrong dc:language ---
+    if 'conflicting dc:language' in all_text:
+        fixes.append((
+            "Conflicting language codes",
+            [
+                "Edit Book > open content.opf (in the left panel under 'Text')",
+                "Find the <metadata> section and locate all <dc:language> entries",
+                "Remove or correct the wrong language code",
+                "  e.g. change <dc:language>pa</dc:language> to <dc:language>pl</dc:language>",
+                "  or remove the incorrect entry entirely if the correct one already exists",
+                "The first <dc:language> is treated as the primary language by most readers",
+            ]
+        ))
+
+    # --- Placeholder metadata ---
+    if 'placeholder' in all_text:
+        fixes.append((
+            "Placeholder metadata values",
+            [
+                "Edit Book > open content.opf",
+                "Find the placeholder text in <metadata> (e.g. ISBN_LUB_ID_WERSJI_DRUKOWANEJ)",
+                "Replace with the actual value, or remove the element if not applicable",
+                "  e.g. <dc:source>978-83-XXXX-XXX-X</dc:source>",
+            ]
+        ))
+
+    # --- Empty href links ---
+    if 'empty href' in all_text:
+        fixes.append((
+            "Empty / broken href links",
+            [
+                "Edit Book > open the flagged .xhtml file",
+                "Find & Replace > search for: href=\"\"",
+                "For each match, either:",
+                "  a) Fill in the correct target: href=\"chapter3.xhtml#section1\"",
+                "  b) Remove the <a> tag if the link is not needed:",
+                "     Before: <a href=\"\">Some text</a>",
+                "     After:  Some text",
+            ]
+        ))
+
+    # --- Invalid CSS selectors ---
+    if 'non-existent html element' in all_text:
+        fixes.append((
+            "Invalid CSS element selectors",
+            [
+                "Edit Book > open the flagged .css file",
+                "Find the invalid selector (e.g. 'png { ... }')",
+                "Fix the typo — common corrections:",
+                "  png { ... }  ->  img { ... }  (if targeting images)",
+                "  or change to a class selector:  .png-image { ... }",
+            ]
+        ))
+
+    # --- Single large content file ---
+    if 'splitting into chapters' in all_text:
+        fixes.append((
+            "Split large file into chapters",
+            [
+                "Edit Book > open the large .xhtml file",
+                "Place cursor at a chapter boundary (e.g. before a <h1> or page-break)",
+                "Edit Book > Tools > Split at Cursor  (or Ctrl+Shift+Return)",
+                "Repeat for each chapter break",
+                "Tip: if chapters start with page-break-before: always, split right before that element",
+                "After splitting, Calibre auto-updates the TOC, spine, and manifest",
+            ]
+        ))
+
+    # --- Cover image below ideal ---
+    if 'cover image' in all_text and ('below ideal' in all_text or 'too small' in all_text):
+        fixes.append((
+            "Cover image resolution",
+            [
+                "Prepare a new cover image: ideal 1600x2560px, JPEG or PNG, sRGB color",
+                "In Calibre main window: right-click book > Edit Metadata > Change Cover",
+                "Or in Edit Book: replace the image file in the Images folder",
+                "  right-click the old cover > Replace with image > select new file",
+            ]
+        ))
+
+    # --- Forced text colors ---
+    if 'forced text colors' in all_text:
+        fixes.append((
+            "Forced text colors (dark mode issue)",
+            [
+                "Edit Book > open the .css stylesheet",
+                "Find hardcoded color values: color: #000000 or color: #333",
+                "Remove them (let reader choose), or use 'inherit':",
+                "  Before: color: #000000;",
+                "  After:  color: inherit;",
+                "Exception: keep intentional accent colors (e.g. red headings)",
+                "  but add a fallback: color: #cc0000; /* intentional emphasis */",
+            ]
+        ))
+
+    # --- Negative margins ---
+    if 'negative margin' in all_text:
+        fixes.append((
+            "Negative margin values",
+            [
+                "Edit Book > open the .css stylesheet",
+                "Search for negative margins: margin-bottom: -4px etc.",
+                "Replace with 0 or a small positive value:",
+                "  Before: margin-bottom: -4px;",
+                "  After:  margin-bottom: 0;",
+            ]
+        ))
+
+    # --- CSS transforms ---
+    if 'css transform' in all_text and 'text-transform' not in all_text:
+        fixes.append((
+            "CSS transforms (PocketBook / InkBook crash)",
+            [
+                "Edit Book > open the .css stylesheet",
+                "Find 'transform:' properties (NOT text-transform — that's safe)",
+                "Remove or replace the transform effects:",
+                "  transform: rotate(...)  — remove entirely for e-readers",
+                "  transform: scale(...)   — use width/height instead",
+                "Note: text-transform: uppercase/lowercase is fine, do NOT remove those",
+            ]
+        ))
+
+    # --- HTML entities ---
+    if 'undeclared entity' in all_text:
+        fixes.append((
+            "Undeclared HTML entities (Apple Books)",
+            [
+                "Edit Book > open the flagged .xhtml file",
+                "Find & Replace (Regex mode):",
+                "  &nbsp;   ->  &#160;",
+                "  &ndash;  ->  &#8211;",
+                "  &mdash;  ->  &#8212;",
+                "  &hellip; ->  &#8230;",
+                "  &copy;   ->  &#169;",
+                "These numeric entities work everywhere without a DOCTYPE declaration",
+            ]
+        ))
+
+    # --- Broken links ---
+    if 'broken link' in all_text:
+        fixes.append((
+            "Broken internal links",
+            [
+                "Edit Book > Tools > Check Book (F7) for a Calibre-native link check",
+                "For each broken link, open the source file and find the href",
+                "Fix the target: correct the filename or fragment ID",
+                "  e.g. href=\"chapter2.xhtml#wrong_id\" -> href=\"chapter2.xhtml#correct_id\"",
+                "Tip: use Edit Book > Tools > Table of Contents > Edit to fix TOC links",
+            ]
+        ))
+
+    # --- Duplicate IDs ---
+    if 'duplicate id' in all_text:
+        fixes.append((
+            "Duplicate ID attributes",
+            [
+                "Edit Book > open each flagged file",
+                "Search for the duplicate id value (e.g. id=\"section1\")",
+                "Rename one of them to be unique (e.g. id=\"section1_ch2\")",
+                "Update any links that reference the renamed ID",
+            ]
+        ))
+
+    # --- Wrong lang attributes on elements ---
+    if "doesn't match" in all_text and 'dc:language' in all_text:
+        fixes.append((
+            "Mismatched lang attributes on content elements",
+            [
+                "Edit Book > open the flagged .xhtml file",
+                "Find & Replace (Regex mode):",
+                "  Search:  lang=\"pa-IN\"  (or whatever wrong code was flagged)",
+                "  Replace: lang=\"pl\"     (or the correct BCP 47 code)",
+                "Also fix xml:lang attributes the same way:",
+                "  Search:  xml:lang=\"pa-IN\"",
+                "  Replace: xml:lang=\"pl\"",
+            ]
+        ))
+
+    # --- CMYK images ---
+    if 'cmyk' in all_text:
+        fixes.append((
+            "CMYK color space images",
+            [
+                "The flagged images use CMYK (print) colors instead of sRGB (screen)",
+                "Open each image in an editor (GIMP, Photoshop, Preview):",
+                "  GIMP: Image > Mode > RGB",
+                "  Photoshop: Edit > Convert to Profile > sRGB",
+                "Save as JPEG or PNG, then in Calibre Edit Book:",
+                "  right-click the old image > Replace with image > select the new file",
+            ]
+        ))
+
+    # --- WOFF/WOFF2 fonts (KDP) ---
+    if 'woff' in all_text and ('not supported' in all_text or 'kdp' in all_text):
+        fixes.append((
+            "WOFF/WOFF2 fonts (KDP incompatible)",
+            [
+                "KDP requires TTF or OTF fonts — WOFF/WOFF2 are not supported",
+                "Find the original TTF/OTF version of the font, then in Edit Book:",
+                "  right-click the .woff file > Replace with file > select the .ttf/.otf",
+                "Update @font-face in CSS: change src url from .woff to .ttf/.otf",
+                "If no TTF/OTF available, convert with an online tool (e.g. CloudConvert)",
+            ]
+        ))
+
+    # --- iBooks-specific features ---
+    if 'ibooks:' in all_text and 'not portable' in all_text:
+        fixes.append((
+            "iBooks-specific metadata",
+            [
+                "Edit Book > open content.opf",
+                "Find lines with 'ibooks:' in property attribute, e.g.:",
+                "  <meta property=\"ibooks:specified-fonts\">true</meta>",
+                "This enables custom fonts in Apple Books — beneficial for Apple devices",
+                "No action needed unless you want strict cross-platform parity",
+                "To remove: delete the <meta> line and the ibooks: prefix declaration",
+            ]
+        ))
+
+    # --- Font obfuscation (informational) ---
+    if 'font obfuscation' in all_text:
+        fixes.append((
+            "Font obfuscation (informational — usually no fix needed)",
+            [
+                "Font obfuscation is standard font-licensing protection, NOT DRM",
+                "All major e-readers handle obfuscated fonts correctly",
+                "No action needed unless a specific reader reports font issues",
+                "To remove: in Calibre, Convert book to EPUB (same format) with",
+                "  'Subset all embedded fonts' unchecked — this strips obfuscation",
+            ]
+        ))
+
+    if not fixes:
+        return
+
+    log("\n" + "="*70)
+    log("EDITOR'S FIX GUIDE (Calibre)")
+    log("="*70)
+    log("")
+    log("Open your EPUB in Calibre > Edit Book (Ctrl+E / Cmd+E) to apply fixes.")
+    log("After all edits: Tools > Check Book (F7) to verify, then save (Ctrl+S).")
+
+    for i, (title, steps) in enumerate(fixes, 1):
+        log(f"\n{i}. {title}")
+        log("   " + "-" * (len(title) + 3))
+        for step in steps:
+            log(f"   {step}")
+
+    log("")
+
+
 def print_report(report: Dict, output_file=None):
     """Pretty print the validation report and optionally save to file"""
     
@@ -1572,7 +2068,15 @@ def print_report(report: Dict, output_file=None):
         r"KDP REQUIRES a functional TOC": "Reference: Amazon KDP requires a functional, linked table of contents for all e-books.",
         r"TIFF image": "Reference: TIFF images are not supported by Amazon KDP. Convert to JPEG or PNG before uploading.",
         r"Fixed font-size units": "Reference: Fixed font sizes (px/pt) prevent users from adjusting text size on Kindle. Use relative units (em, rem, %).",
-        r"not supported by KDP": "Note: Since March 2025, Amazon KDP accepts EPUB directly (MOBI uploads are no longer accepted). Ensure your EPUB meets KDP requirements before uploading."
+        r"not supported by KDP": "Note: Since March 2025, Amazon KDP accepts EPUB directly (MOBI uploads are no longer accepted). Ensure your EPUB meets KDP requirements before uploading.",
+        r"Font obfuscation": "Note: Font obfuscation (IDPF/Adobe) is a standard practice for font licensing compliance and does not restrict reading. Not the same as DRM.",
+        r"conflicting dc:language": "Reference: Multiple dc:language entries should be consistent. The first entry is treated as the primary language. EPUB 3.3 \u00a7 4.2.2",
+        r"doesn't match.*dc:language": "Note: Mismatched lang attributes affect text-to-speech, spell-checking, and hyphenation for accessibility.",
+        r"Empty href": "Note: Empty href attributes create broken navigation links. Replace with valid targets or remove the anchor element.",
+        r"Possible placeholder": "Note: Placeholder metadata should be replaced with actual values before publishing.",
+        r"non-existent HTML element": "Note: CSS element selectors that don't match valid HTML elements have no effect and likely indicate a typo.",
+        r"single file|Single file|splitting into chapters": "Note: Splitting content into separate chapter files improves reader memory usage, navigation, and bookmarking.",
+        r"CMYK color space": "Reference: Amazon KDP and most e-readers expect sRGB color space. CMYK images may display with shifted colors after conversion."
     }
     
     def log(msg=""):
@@ -1606,7 +2110,9 @@ def print_report(report: Dict, output_file=None):
         log(f"[FONTS]   {info['font_count']}")
     if info.get('identifier'):
         log(f"[ID]      {info['identifier']}")
-    if info.get('language'):
+    if info.get('all_languages') and len(info['all_languages']) > 1:
+        log(f"[LANG]    {', '.join(info['all_languages'])} (primary: {info['all_languages'][0]})")
+    elif info.get('language'):
         log(f"[LANG]    {info['language']}")
     
     # Platform-specific reports
@@ -1669,11 +2175,17 @@ def print_report(report: Dict, output_file=None):
                 log(f"   [CRITICAL] {issue}")
         
         if critical.get('pocketbook'):
-            log("\nPOCKETBOOK - Rendering Stops Early:")
+            log("\nPOCKETBOOK - Rendering Issues:")
             for issue in critical['pocketbook']:
                 log(f"   [CRITICAL] {issue}")
-            log("   [SUGGESTION] Remove CSS transform properties from stylesheet")
-            log("   [NOTE] InkBook readers have similar CSS transform issues")
+            # Dynamic suggestions based on actual issues found
+            has_transforms = any('transform' in i.lower() for i in critical['pocketbook'])
+            has_margins = any('margin' in i.lower() for i in critical['pocketbook'])
+            if has_transforms:
+                log("   [SUGGESTION] Remove CSS transform properties from stylesheet")
+            if has_margins:
+                log("   [SUGGESTION] Reduce large margin values (max 2em) or move spacing to CSS classes")
+            log("   [NOTE] InkBook readers have similar rendering issues")
 
         if critical.get('kindle'):
             log("\nAMAZON KDP - Publishing May Be Rejected:")
@@ -1685,10 +2197,13 @@ def print_report(report: Dict, output_file=None):
             for issue in critical['general']:
                 log(f"   [CRITICAL] {issue}")
     
+    # Editor's Fix Guide (Calibre)
+    _print_calibre_guide(report, log)
+
     # Summary
     total_issues = sum(len(v) for v in report['issues'].values())
     total_warnings = sum(len(v) for v in report['warnings'].values())
-    
+
     log("\n" + "="*70)
     log(f"SUMMARY: {total_issues} issues, {total_warnings} warnings")
     if has_critical:
