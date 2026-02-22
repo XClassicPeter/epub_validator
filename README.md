@@ -2,7 +2,7 @@
 
 A comprehensive EPUB validation tool that checks e-book files for compatibility issues across different reading platforms and devices.
 
-[![Version](https://img.shields.io/badge/version-1.3-blue.svg)](https://github.com/XClassicPeter/epub_validator)
+[![Version](https://img.shields.io/badge/version-1.5-blue.svg)](https://github.com/XClassicPeter/epub_validator)
 [![Python](https://img.shields.io/badge/python-3.7+-green.svg)](https://www.python.org/)
 [![License](https://img.shields.io/badge/license-MIT-orange.svg)](LICENSE)
 
@@ -336,31 +336,38 @@ Different e-reader platforms have varying levels of EPUB support. Understanding 
   - Complex CSS may not render
 - **Best For**: Simple text layouts, standard books
 
-### Kindle
+### Amazon KDP (Kindle)
 
-**Support Level**: ⭐⭐⭐ Good (requires conversion)
+**Support Level**: ⭐⭐⭐⭐ Very Good (EPUB accepted directly since March 2025)
 
-- **Format**: Does NOT support EPUB directly
-- **Requirement**: Convert to MOBI/AZW3 format
-- **Tools**: Kindle Previewer, KindleGen (deprecated), Amazon KDP upload
-- **Rendering Engine**: Custom (Mobi7 for old devices, KF8 for newer)
+- **Format**: EPUB accepted directly (MOBI uploads no longer accepted as of March 2025)
+- **Tools**: Kindle Previewer, Amazon KDP upload
+- **Rendering Engine**: Custom with Enhanced Typesetting
+- **Cover Requirements**:
+  - Minimum: 625x1000px, Ideal: 1600x2560px, Maximum: 10000px
+  - Format: JPEG or PNG only (no TIFF, no CMYK)
+- **Required Metadata**: dc:identifier (ISBN/ASIN/UUID), dc:title, dc:language
 - **Limitations**:
-  - EPUB 3 features lost in conversion
-  - Complex CSS often simplified
-  - SVG converted to raster
-  - WOFF fonts not supported (TTF/OTF only)
+  - WOFF/WOFF2 fonts not supported (use TTF/OTF)
   - Audio/video not supported
-  - Fixed layout support limited
-  - GIF images converted to grayscale
-  - 650MB limit for email delivery
+  - `<script>`, `<form>`, `<input>`, `<canvas>`, `<iframe>` stripped
+  - MathML not supported by Enhanced Typesetting
+  - Fixed font sizes (px/pt) prevent user text resizing
+  - TIFF images not supported
+  - Animated GIFs display only first frame
+  - 650MB limit for email delivery, 300 HTML file limit
+- **Enhanced Typesetting Blockers**:
+  - Base64-encoded images
+  - SVG namespace prefixes
+  - CSS linear-gradient(), caption-side:bottom
+  - Float in table cells
+- **CSS Restrictions**:
+  - Negative margins may clip content
+  - :nth-child, :first-child, :visited not supported
+  - ::before/::after limited support
+  - body font-family override prevents reader font selection
 
-**Conversion Issues**:
-- Complex tables may break
-- Custom fonts may not embed correctly
-- Margins and spacing may change
-- CSS pseudo-elements limited
-
-**Best Practice**: Test with Kindle Previewer before publishing
+**Best Practice**: Run this validator's Amazon KDP checks before uploading to catch publishing blockers
 
 ### Android Readers (Google Play Books, ReadEra, Moon+ Reader, etc.)
 
@@ -525,14 +532,17 @@ Different e-reader platforms have varying levels of EPUB support. Understanding 
 
 **Solution**: Reduce margins to <2em or use pixel values
 
-### Issue: Kindle rejects EPUB upload
+### Issue: Amazon KDP rejects EPUB upload
 
 **Cause**: Multiple issues possible
-1. Invalid structure (missing mimetype, container.xml)
-2. File too large (>650MB for email delivery)
-3. Unsupported features (EPUB 3 advanced features)
+1. Missing cover image or cover too small (<625x1000px)
+2. Missing dc:identifier metadata
+3. Missing table of contents
+4. Unsupported content (scripts, forms, audio/video)
+5. WOFF/WOFF2 fonts (use TTF/OTF instead)
+6. File too large (>650MB) or too many HTML files (>300)
 
-**Solution**: Run validator, fix structural errors, convert with Kindle Previewer
+**Solution**: Run validator with KDP checks enabled, fix all Amazon KDP errors before uploading
 
 ### Issue: Images don't show on some readers
 
@@ -584,7 +594,7 @@ MIT License - see [LICENSE](LICENSE) file for details.
 
 ---
 
-**Version**: 1.3  
-**Last Updated**: December 3, 2025  
+**Version**: 1.5
+**Last Updated**: February 22, 2026  
 **Author**: XClassicPeter  
 **Repository**: https://github.com/XClassicPeter/epub_validator

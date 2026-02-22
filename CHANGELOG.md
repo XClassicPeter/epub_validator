@@ -2,6 +2,32 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.5] - 2026-02-22
+
+### Added
+- **Amazon KDP Pre-Publish Validator**: Comprehensive pre-upload checks for Amazon Kindle Direct Publishing
+  - Cover image validation: dimensions (min 625x1000, ideal 1600x2560, max 10000), format (JPEG/PNG), CMYK detection
+  - Metadata checks: dc:identifier (REQUIRED), dc:title, dc:creator
+  - File limits: individual HTML <30MB, total HTML <300 files
+  - TOC quality: table-based layout detection, page number detection, landmarks/guide check
+  - Unsupported HTML: `<script>`, `<form>`, `<input>`, `<canvas>`, `<iframe>`, `<audio>`, `<video>`, MathML
+  - CSS restrictions: fixed font units, negative margins, max-width/height, pseudo-classes/elements, body font override
+  - Enhanced Typesetting checks: base64 images, SVG namespace prefixes, float in tables, linear-gradient, caption-side
+  - Image requirements: TIFF rejection, alt text check, animated GIF detection
+  - Font rules: WOFF/WOFF2 upgraded to ERROR (from WARN)
+  - Content quality: excessive nbsp, body bold/italic, forced text colors
+- 16 new pre-compiled regex patterns for KDP-specific checks
+- Critical summary section for Amazon KDP publishing blockers
+- dc:identifier extraction and display in report header
+- New EXPLANATIONS for KDP cover, Enhanced Typesetting, dc:identifier, TOC, TIFF, font-size units, MOBI deprecation
+
+### Changed
+- Platform display renamed from "Kindle" to "Amazon KDP" in reports
+- `_check_kindle_issues()` restructured as orchestrator calling 10 specialized sub-methods
+- WOFF/WOFF2 font warnings for Kindle moved from WARN to ERROR severity
+- Kindle WOFF warning removed from general `_validate_fonts()` (now in `_kdp_check_font_rules`)
+- Report header now shows identifier and language metadata
+
 ## [1.4] - 2025-12-03
 
 ### Added

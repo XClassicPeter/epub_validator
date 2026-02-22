@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
 EPUB Validator - Assess EPUB files for compatibility issues across different readers
-Supports: Standard PC readers, Apple Books, PocketBook, and Kindle
+Supports: Standard PC readers, Apple Books, PocketBook, and Amazon KDP
 
-Version: 1.4
-Last Updated: 2025-12-03
+Version: 1.5
+Last Updated: 2026-02-22
 
 See CHANGELOG.md for version history.
 """
@@ -37,7 +37,25 @@ class EPUBValidator:
     RE_LARGE_MARGIN = re.compile(r'margin[^:]*:\s*(\d+(?:\.\d+)?)(em|rem)', re.IGNORECASE)
     RE_VIEWPORT_UNITS = re.compile(r'\d+vw|\d+vh|\d+vmin|\d+vmax')
     RE_BCP47 = re.compile(r'^[a-zA-Z]{2,3}(-[a-zA-Z]{2,4})?(-[a-zA-Z]{4})?(-[a-zA-Z0-9]{2,8})*$')
-    
+
+    # KDP-specific pre-compiled patterns
+    RE_FORM_ELEMENTS = re.compile(r'<(form|input|canvas|iframe)[\s>]', re.IGNORECASE)
+    RE_AUDIO_VIDEO_HTML = re.compile(r'<(audio|video)[\s>]', re.IGNORECASE)
+    RE_BASE64_IMAGE = re.compile(r'src\s*=\s*["\']data:image/', re.IGNORECASE)
+    RE_IMG_ALT = re.compile(r'<img\s[^>]*?/?>', re.IGNORECASE | re.DOTALL)
+    RE_CSS_FONT_SIZE_FIXED = re.compile(r'font-size\s*:\s*\d+(?:\.\d+)?\s*(?:px|pt)\b', re.IGNORECASE)
+    RE_CSS_NEGATIVE_MARGIN = re.compile(r'margin[^:]*:\s*[^;]*-\d', re.IGNORECASE)
+    RE_CSS_MAX_DIM = re.compile(r'max-(?:width|height)\s*:', re.IGNORECASE)
+    RE_CSS_PSEUDO_UNSUPPORTED = re.compile(r':(?:nth-child|first-child|visited)\b', re.IGNORECASE)
+    RE_CSS_PSEUDO_ELEMENT = re.compile(r'::(?:before|after)\b', re.IGNORECASE)
+    RE_CSS_LINEAR_GRADIENT = re.compile(r'linear-gradient\s*\(', re.IGNORECASE)
+    RE_CSS_CAPTION_SIDE = re.compile(r'caption-side\s*:\s*bottom', re.IGNORECASE)
+    RE_CSS_BODY_FONT_OVERRIDE = re.compile(r'body\s*\{[^}]*font-family\s*:', re.IGNORECASE | re.DOTALL)
+    RE_NBSP_EXCESSIVE = re.compile(r'(?:&nbsp;|&#160;)\s*(?:&nbsp;|&#160;)\s*(?:&nbsp;|&#160;)', re.IGNORECASE)
+    RE_CSS_COLOR_FORCE = re.compile(r'(?<![a-zA-Z-])color\s*:\s*(?:#[0-9a-fA-F]{3,6}|rgb)', re.IGNORECASE)
+    RE_CSS_BODY_BOLD = re.compile(r'body\s*\{[^}]*font-weight\s*:\s*bold', re.IGNORECASE | re.DOTALL)
+    RE_CSS_BODY_ITALIC = re.compile(r'body\s*\{[^}]*font-style\s*:\s*italic', re.IGNORECASE | re.DOTALL)
+
     # Namespaces commonly used in EPUB
     NAMESPACES = {
         'opf': 'http://www.idpf.org/2007/opf',
@@ -74,6 +92,7 @@ class EPUBValidator:
             'title': 'Unknown',
             'author': 'Unknown',
             'version': 'Unknown',
+            'identifier': None,
             'file_count': 0,
             'image_count': 0,
             'css_count': 0
@@ -184,7 +203,7 @@ class EPUBValidator:
                 self._check_pc_reader_issues(opf_root, manifest)
                 self._check_apple_books_issues(opf_root, manifest)
                 self._check_pocketbook_issues(opf_root, manifest)
-                self._check_kindle_issues(opf_root, manifest, spine)
+                self._check_kindle_issues(opf_root, manifest, spine, epub)
                 self._check_kobo_issues(opf_root, manifest)
                 self._check_inkbook_issues(opf_root, manifest)
                 self._check_android_issues(opf_root, manifest)
@@ -273,7 +292,12 @@ class EPUBValidator:
                         f"Invalid language code '{lang_code}' - should be BCP 47 format (e.g., 'en', 'en-US', 'zh-Hans')"
                     )
                 self.info['language'] = lang_code
-        
+
+            # Identifier
+            identifier = metadata.find('.//dc:identifier', self.NAMESPACES)
+            if identifier is not None and identifier.text:
+                self.info['identifier'] = identifier.text.strip()
+
         # EPUB version
         package = opf_root
         version = package.get('version', 'Unknown')
@@ -802,9 +826,6 @@ class EPUBValidator:
                 
                 # WOFF/WOFF2 warnings
                 if '.woff' in href.lower():
-                    self.warnings['kindle'].append(
-                        f"WOFF font '{href}' not supported on older Kindle devices"
-                    )
                     self.warnings['pocketbook'].append(
                         f"WOFF font '{href}' may not be supported on all PocketBook models"
                     )
@@ -984,31 +1005,458 @@ class EPUBValidator:
         # JavaScript warnings (very limited support)
         # Already covered in general checks
     
-    def _check_kindle_issues(self, opf_root: ET.Element, manifest: Dict, spine: List):
-        """Check for Kindle specific issues"""
-        # Kindle has the most restrictions
-        # Note: EPUB format requires conversion to MOBI/AZW3 for Kindle
-        # We don't add a blanket "requires conversion" message as it's noise for every EPUB
-        
-        # Check for audio/video (not supported even after conversion)
-        media_types = ['audio/mpeg', 'audio/mp4', 'video/mp4', 'video/h264']
-        has_media = False
-        for item_id, item_info in manifest.items():
-            if item_info['media_type'] in media_types:
-                has_media = True
-                self.issues['kindle'].append(
-                    f"Audio/Video content '{item_info['href']}' not supported on Kindle"
+    def _check_kindle_issues(self, opf_root: ET.Element, manifest: Dict, spine: List,
+                             epub: zipfile.ZipFile = None):
+        """Check for Amazon KDP specific issues (comprehensive pre-publish validation)"""
+        if epub is None:
+            return
+
+        self._kdp_check_cover_image(epub, manifest, opf_root)
+        self._kdp_check_metadata(opf_root)
+        self._kdp_check_file_limits(epub, manifest)
+        self._kdp_check_toc_quality(epub, opf_root, manifest)
+        self._kdp_check_unsupported_html(epub, manifest)
+        self._kdp_check_css_restrictions(epub, manifest)
+        self._kdp_check_enhanced_typesetting(epub, manifest)
+        self._kdp_check_image_requirements(epub, manifest)
+        self._kdp_check_font_rules(manifest)
+        self._kdp_check_content_quality(epub, manifest)
+
+    def _is_cmyk_jpeg(self, img_data: bytes) -> bool:
+        """Check if JPEG uses CMYK color space by examining SOF marker"""
+        i = 0
+        while i < len(img_data) - 9:
+            if img_data[i] == 0xFF and img_data[i + 1] in (0xC0, 0xC1, 0xC2):
+                num_components = img_data[i + 9]
+                return num_components == 4
+            i += 1
+        return False
+
+    def _kdp_check_cover_image(self, epub: zipfile.ZipFile, manifest: Dict, opf_root: ET.Element):
+        """Check cover image requirements for Amazon KDP"""
+        cover_items = [item for item in manifest.values()
+                       if 'cover-image' in item.get('properties', '')]
+
+        # Also check EPUB2 meta name="cover"
+        if not cover_items:
+            metadata = opf_root.find('.//opf:metadata', self.NAMESPACES)
+            if metadata is not None:
+                for meta in metadata.findall('.//opf:meta', self.NAMESPACES):
+                    if meta.get('name') == 'cover':
+                        cover_id = meta.get('content')
+                        if cover_id and cover_id in manifest:
+                            cover_items = [manifest[cover_id]]
+                            break
+
+        if not cover_items:
+            self.issues['kindle'].append(
+                "No cover image found - Amazon KDP REQUIRES a cover image for publishing"
+            )
+            return
+
+        cover = cover_items[0]
+
+        # Check format (JPEG or PNG only)
+        if cover['media_type'] not in ('image/jpeg', 'image/png'):
+            self.issues['kindle'].append(
+                f"Cover image format '{cover['media_type']}' not accepted - KDP requires JPEG or PNG"
+            )
+
+        try:
+            img_data = epub.read(cover['href'])
+            width, height = self._get_image_dimensions(img_data, cover['media_type'])
+            if width and height:
+                # Minimum dimensions
+                if width < 625 or height < 1000:
+                    self.issues['kindle'].append(
+                        f"Cover too small ({width}x{height}px) - KDP minimum is 625x1000px"
+                    )
+                elif width < 1600 or height < 2560:
+                    self.warnings['kindle'].append(
+                        f"Cover image ({width}x{height}px) below ideal - KDP recommends 1600x2560px"
+                    )
+
+                # Maximum dimensions
+                if width > 10000 or height > 10000:
+                    self.issues['kindle'].append(
+                        f"Cover too large ({width}x{height}px) - KDP maximum dimension is 10000px"
+                    )
+
+            # CMYK detection for JPEG
+            if cover['media_type'] == 'image/jpeg' and self._is_cmyk_jpeg(img_data):
+                self.warnings['kindle'].append(
+                    "Cover image uses CMYK color space - KDP converts to sRGB which may shift colors"
                 )
-        
-        # Only add table warning if there's actual content (avoid noise)
-        # Check for MathML which definitely doesn't work well
+        except (KeyError, IOError, struct.error):
+            pass
+
+    def _kdp_check_metadata(self, opf_root: ET.Element):
+        """Check metadata requirements for Amazon KDP"""
+        metadata = opf_root.find('.//opf:metadata', self.NAMESPACES)
+        if metadata is None:
+            self.issues['kindle'].append(
+                "No metadata section found - KDP requires title, author, and identifier"
+            )
+            return
+
+        # dc:identifier is REQUIRED for KDP
+        identifier = metadata.find('.//dc:identifier', self.NAMESPACES)
+        if identifier is None or not (identifier.text and identifier.text.strip()):
+            self.issues['kindle'].append(
+                "Missing dc:identifier - Amazon KDP REQUIRES a unique book identifier (ISBN, ASIN, or UUID)"
+            )
+
+        # dc:title
+        title = metadata.find('.//dc:title', self.NAMESPACES)
+        if title is None or not (title.text and title.text.strip()):
+            self.issues['kindle'].append(
+                "Missing dc:title - Amazon KDP requires a book title in metadata"
+            )
+
+        # dc:creator
+        creator = metadata.find('.//dc:creator', self.NAMESPACES)
+        if creator is None or not (creator.text and creator.text.strip()):
+            self.warnings['kindle'].append(
+                "Missing dc:creator - Amazon KDP recommends author name in metadata"
+            )
+
+    def _kdp_check_file_limits(self, epub: zipfile.ZipFile, manifest: Dict):
+        """Check KDP file count and size limits"""
+        html_count = 0
         for item_id, item_info in manifest.items():
-            properties = item_info.get('properties', '')
-            if 'mathml' in properties.lower():
-                self.issues['kindle'].append(
-                    "MathML content not supported on Kindle devices"
+            if item_info['media_type'] in ('application/xhtml+xml', 'text/html'):
+                html_count += 1
+                try:
+                    info = epub.getinfo(item_info['href'])
+                    size_mb = info.file_size / (1024 * 1024)
+                    if size_mb > 30:
+                        self.issues['kindle'].append(
+                            f"HTML file '{item_info['href']}' ({size_mb:.1f}MB) exceeds KDP 30MB per-file limit"
+                        )
+                except KeyError:
+                    pass
+
+        if html_count > 300:
+            self.issues['kindle'].append(
+                f"Too many HTML files ({html_count}) - KDP may reject EPUBs with more than 300 content files"
+            )
+
+    def _kdp_check_toc_quality(self, epub: zipfile.ZipFile, opf_root: ET.Element, manifest: Dict):
+        """Check table of contents quality for Amazon KDP"""
+        version = self.info.get('version', '')
+        nav_content = None
+        nav_href = None
+
+        # Find nav document (EPUB3) or NCX (EPUB2)
+        if version.startswith('3'):
+            for item_id, item_info in manifest.items():
+                if 'nav' in item_info.get('properties', ''):
+                    nav_href = item_info['href']
+                    nav_content = self._read_file_cached(epub, nav_href)
+                    break
+
+        if nav_content is None:
+            for item_id, item_info in manifest.items():
+                if item_info['media_type'] == 'application/x-dtbncx+xml':
+                    nav_href = item_info['href']
+                    nav_content = self._read_file_cached(epub, nav_href)
+                    break
+
+        if nav_content is None:
+            self.issues['kindle'].append(
+                "No table of contents found - Amazon KDP REQUIRES a functional TOC"
+            )
+            return
+
+        # Check for table-based TOC layout
+        if '<table' in nav_content.lower():
+            self.warnings['kindle'].append(
+                f"TOC uses <table> layout ({nav_href}) - KDP recommends list-based navigation"
+            )
+
+        # Check for page numbers in TOC (common in print conversions)
+        page_pattern = re.compile(
+            r'>\s*.*?\.\s*\.\s*\.\s*\d+\s*<|>\s*page\s+\d+\s*<', re.IGNORECASE
+        )
+        if page_pattern.search(nav_content):
+            self.warnings['kindle'].append(
+                f"TOC contains page numbers ({nav_href}) - remove for KDP "
+                f"(reflowable content has no fixed pages)"
+            )
+
+        # Check for landmarks (EPUB3) or guide (EPUB2)
+        if version.startswith('3'):
+            if 'landmarks' not in nav_content.lower():
+                self.warnings['kindle'].append(
+                    f"No landmarks navigation in TOC ({nav_href}) - "
+                    f"adding landmarks helps KDP build 'Go to' menu"
                 )
-    
+        elif version.startswith('2'):
+            guide = opf_root.find('.//opf:guide', self.NAMESPACES)
+            if guide is None or len(guide.findall('.//opf:reference', self.NAMESPACES)) == 0:
+                self.warnings['kindle'].append(
+                    "No <guide> element in OPF - adding guide references helps KDP build navigation"
+                )
+
+    def _kdp_check_unsupported_html(self, epub: zipfile.ZipFile, manifest: Dict):
+        """Check for HTML elements not supported by Amazon KDP"""
+        # Check manifest for unsupported media types
+        media_types_unsupported = ('audio/mpeg', 'audio/mp4', 'video/mp4', 'video/h264')
+        for item_id, item_info in manifest.items():
+            if item_info['media_type'] in media_types_unsupported:
+                self.issues['kindle'].append(
+                    f"Audio/video content '{item_info['href']}' not supported on KDP"
+                )
+
+        for item_id, item_info in manifest.items():
+            if item_info['media_type'] not in ('application/xhtml+xml', 'text/html'):
+                continue
+
+            content = self._read_file_cached(epub, item_info['href'])
+            if not content:
+                continue
+
+            href = item_info['href']
+            content_clean = self.RE_COMMENT.sub('', content)
+
+            # Form elements, canvas, iframe
+            reported_tags = set()
+            for match in self.RE_FORM_ELEMENTS.finditer(content_clean):
+                tag = match.group(1).lower()
+                if tag not in reported_tags:
+                    reported_tags.add(tag)
+                    self.issues['kindle'].append(
+                        f"Unsupported <{tag}> element in '{href}' - not supported by KDP"
+                    )
+
+            # Audio/video HTML tags
+            for match in self.RE_AUDIO_VIDEO_HTML.finditer(content_clean):
+                tag = match.group(1).lower()
+                if tag not in reported_tags:
+                    reported_tags.add(tag)
+                    self.issues['kindle'].append(
+                        f"Unsupported <{tag}> element in '{href}' - not supported by KDP"
+                    )
+
+            # Script tags
+            if self.RE_SCRIPT_TAG.search(content_clean):
+                self.issues['kindle'].append(
+                    f"JavaScript in '{href}' - scripts are stripped by KDP processing"
+                )
+
+            # MathML
+            if 'mathml' in item_info.get('properties', '').lower() or '<math' in content_clean.lower():
+                self.issues['kindle'].append(
+                    f"MathML content in '{href}' - not supported by KDP Enhanced Typesetting"
+                )
+
+    def _kdp_check_css_restrictions(self, epub: zipfile.ZipFile, manifest: Dict):
+        """Check CSS restrictions for Amazon KDP"""
+        css_files = [item for item in manifest.values() if item['media_type'] == 'text/css']
+
+        for css_file in css_files:
+            href = css_file['href']
+            content = self._read_file_cached(epub, href)
+            if not content:
+                continue
+
+            clean = self.RE_CSS_COMMENT.sub('', content)
+
+            # Fixed font-size units (px/pt)
+            if self.RE_CSS_FONT_SIZE_FIXED.search(clean):
+                self.warnings['kindle'].append(
+                    f"Fixed font-size units (px/pt) in '{href}' - use relative units (em/rem/%) for KDP"
+                )
+
+            # Negative margins
+            if self.RE_CSS_NEGATIVE_MARGIN.search(clean):
+                self.warnings['kindle'].append(
+                    f"Negative margin values in '{href}' - may cause clipped content on Kindle devices"
+                )
+
+            # max-width/max-height
+            if self.RE_CSS_MAX_DIM.search(clean):
+                self.warnings['kindle'].append(
+                    f"max-width/max-height in '{href}' - may be ignored by KDP rendering engine"
+                )
+
+            # Unsupported pseudo-classes
+            if self.RE_CSS_PSEUDO_UNSUPPORTED.search(clean):
+                self.warnings['kindle'].append(
+                    f"Unsupported CSS pseudo-classes (:nth-child/:first-child/:visited) in '{href}'"
+                )
+
+            # Pseudo-elements
+            if self.RE_CSS_PSEUDO_ELEMENT.search(clean):
+                self.warnings['kindle'].append(
+                    f"CSS pseudo-elements (::before/::after) in '{href}' - limited KDP support"
+                )
+
+            # Body font-family override
+            if self.RE_CSS_BODY_FONT_OVERRIDE.search(clean):
+                self.warnings['kindle'].append(
+                    f"body font-family override in '{href}' - may prevent reader font selection on Kindle"
+                )
+
+    def _kdp_check_enhanced_typesetting(self, epub: zipfile.ZipFile, manifest: Dict):
+        """Check for patterns that break Amazon KDP Enhanced Typesetting"""
+        for item_id, item_info in manifest.items():
+            if item_info['media_type'] not in ('application/xhtml+xml', 'text/html'):
+                continue
+
+            content = self._read_file_cached(epub, item_info['href'])
+            if not content:
+                continue
+
+            href = item_info['href']
+
+            # Base64-encoded images
+            if self.RE_BASE64_IMAGE.search(content):
+                self.warnings['kindle'].append(
+                    f"Base64-encoded image in '{href}' - disables Enhanced Typesetting; use external image files"
+                )
+
+            # SVG with namespace prefixes (e.g., svg:rect instead of rect)
+            if 'svg:' in content.lower() and '<svg' in content.lower():
+                self.warnings['kindle'].append(
+                    f"SVG namespace prefixes in '{href}' - may break KDP rendering; use default namespace"
+                )
+
+            # Float inside table cells (inline styles)
+            if re.search(r'<t[dh][^>]*style=[^>]*float\s*:', content, re.IGNORECASE):
+                self.warnings['kindle'].append(
+                    f"Float in table cells in '{href}' - breaks Enhanced Typesetting"
+                )
+
+        # Check CSS for enhanced typesetting breakers
+        css_files = [item for item in manifest.values() if item['media_type'] == 'text/css']
+        for css_file in css_files:
+            href = css_file['href']
+            content = self._read_file_cached(epub, href)
+            if not content:
+                continue
+
+            clean = self.RE_CSS_COMMENT.sub('', content)
+
+            # linear-gradient
+            if self.RE_CSS_LINEAR_GRADIENT.search(clean):
+                self.warnings['kindle'].append(
+                    f"CSS linear-gradient() in '{href}' - not supported by KDP Enhanced Typesetting"
+                )
+
+            # caption-side: bottom
+            if self.RE_CSS_CAPTION_SIDE.search(clean):
+                self.warnings['kindle'].append(
+                    f"caption-side:bottom in '{href}' - not supported by KDP Enhanced Typesetting"
+                )
+
+    def _kdp_check_image_requirements(self, epub: zipfile.ZipFile, manifest: Dict):
+        """Check image requirements for Amazon KDP"""
+        for item_id, item_info in manifest.items():
+            media_type = item_info['media_type']
+            href = item_info['href']
+
+            # TIFF not supported
+            if media_type == 'image/tiff' or href.lower().endswith(('.tiff', '.tif')):
+                self.issues['kindle'].append(
+                    f"TIFF image '{href}' not supported by KDP - convert to JPEG or PNG"
+                )
+
+            # Animated GIF detection
+            if media_type == 'image/gif':
+                try:
+                    gif_data = epub.read(href)
+                    if b'NETSCAPE2.0' in gif_data or b'NETSCAPE 2.0' in gif_data:
+                        self.warnings['kindle'].append(
+                            f"Animated GIF '{href}' - KDP displays only first frame"
+                        )
+                except (KeyError, IOError):
+                    pass
+
+        # Check alt text on images in HTML content
+        missing_alt_count = 0
+        for item_id, item_info in manifest.items():
+            if item_info['media_type'] not in ('application/xhtml+xml', 'text/html'):
+                continue
+            content = self._read_file_cached(epub, item_info['href'])
+            if not content:
+                continue
+            for match in self.RE_IMG_ALT.finditer(content):
+                img_tag = match.group(0)
+                if 'alt=' not in img_tag.lower():
+                    missing_alt_count += 1
+
+        if missing_alt_count > 0:
+            self.warnings['kindle'].append(
+                f"{missing_alt_count} image(s) missing alt text - KDP recommends alt attributes for accessibility"
+            )
+
+    def _kdp_check_font_rules(self, manifest: Dict):
+        """Check font requirements for Amazon KDP"""
+        for item_id, item_info in manifest.items():
+            href = item_info['href']
+            if href.lower().endswith('.woff') or item_info['media_type'] == 'font/woff':
+                self.issues['kindle'].append(
+                    f"WOFF font '{href}' not supported by KDP - use TTF or OTF format"
+                )
+            elif href.lower().endswith('.woff2') or item_info['media_type'] == 'font/woff2':
+                self.issues['kindle'].append(
+                    f"WOFF2 font '{href}' not supported by KDP - use TTF or OTF format"
+                )
+
+    def _kdp_check_content_quality(self, epub: zipfile.ZipFile, manifest: Dict):
+        """Check content quality issues for Amazon KDP"""
+        excessive_nbsp_files = []
+
+        for item_id, item_info in manifest.items():
+            if item_info['media_type'] not in ('application/xhtml+xml', 'text/html'):
+                continue
+
+            content = self._read_file_cached(epub, item_info['href'])
+            if not content:
+                continue
+
+            href = item_info['href']
+
+            # Excessive non-breaking spaces
+            if self.RE_NBSP_EXCESSIVE.search(content):
+                excessive_nbsp_files.append(href)
+
+        if excessive_nbsp_files:
+            self.warnings['kindle'].append(
+                f"Excessive non-breaking spaces in {len(excessive_nbsp_files)} file(s) - "
+                f"use CSS margins/padding for spacing instead"
+            )
+
+        # Check CSS for body-level bold/italic and forced colors
+        css_files = [item for item in manifest.values() if item['media_type'] == 'text/css']
+        color_file_count = 0
+        for css_file in css_files:
+            content = self._read_file_cached(epub, css_file['href'])
+            if not content:
+                continue
+            clean = self.RE_CSS_COMMENT.sub('', content)
+            href = css_file['href']
+
+            if self.RE_CSS_BODY_BOLD.search(clean):
+                self.warnings['kindle'].append(
+                    f"body {{ font-weight: bold }} in '{href}' - forces all text bold, not recommended for KDP"
+                )
+            if self.RE_CSS_BODY_ITALIC.search(clean):
+                self.warnings['kindle'].append(
+                    f"body {{ font-style: italic }} in '{href}' - forces all text italic, not recommended for KDP"
+                )
+
+            # Count files with forced text colors
+            if self.RE_CSS_COLOR_FORCE.search(clean):
+                color_file_count += 1
+
+        if color_file_count > 0:
+            self.warnings['kindle'].append(
+                f"Forced text colors in {color_file_count} CSS file(s) - "
+                f"may be invisible in Kindle dark mode"
+            )
+
     def _generate_report(self) -> Dict:
         """Generate final validation report"""
         # Generate critical issues summary
@@ -1026,6 +1474,7 @@ class EPUBValidator:
         summary = {
             'apple_books': [],
             'pocketbook': [],
+            'kindle': [],
             'general': []
         }
         
@@ -1056,7 +1505,23 @@ class EPUBValidator:
         if len(ib_issues) > 0:
             # InkBook shares similar issues with PocketBook
             pass
-        
+
+        # Check for KDP blockers
+        kindle_issues = self.issues['kindle']
+        if any('cover' in i.lower() and ('requires' in i.lower() or 'too small' in i.lower()
+               or 'not accepted' in i.lower()) for i in kindle_issues):
+            summary['kindle'].append("Cover image issues may prevent KDP publishing")
+        if any('dc:identifier' in i.lower() for i in kindle_issues):
+            summary['kindle'].append("Missing required dc:identifier metadata")
+        if any('table of contents' in i.lower() for i in kindle_issues):
+            summary['kindle'].append("Missing table of contents required by KDP")
+        unsupported = [i for i in kindle_issues
+                       if 'unsupported' in i.lower() or 'not supported' in i.lower()]
+        if unsupported:
+            summary['kindle'].append(
+                f"Unsupported content ({len(unsupported)} issues) may be stripped or cause rejection"
+            )
+
         # Check for general critical issues
         gen_issues = self.issues['general']
         entity_count = len([i for i in gen_issues if 'entity' in i.lower() and 'nbsp' in i.lower()])
@@ -1100,7 +1565,14 @@ def print_report(report: Dict, output_file=None):
         r"Spine references": "Reference: All spine itemrefs must reference valid manifest items. EPUB 3.3 \u00a7 4.3",
         r"Duplicate ID": "Reference: XML IDs must be unique across all documents. XML 1.0 \u00a7 3.3.1, EPUB 3.3 \u00a7 3.3.2",
         r"Broken link": "Reference: All internal links must reference valid files and IDs. EPUB 3.3 \u00a7 3.3.2",
-        r"cover image|cover-image": "Reference: Cover image should be designated with properties='cover-image' in manifest. EPUB 3.3 \u00a7 3.2"
+        r"cover image|cover-image": "Reference: Cover image should be designated with properties='cover-image' in manifest. EPUB 3.3 \u00a7 3.2",
+        r"KDP REQUIRES a cover": "Reference: Amazon KDP requires a cover image of at least 625x1000px (ideal 1600x2560px). JPEG or PNG only. See: https://kdp.amazon.com/en_US/help/topic/G200645690",
+        r"dc:identifier": "Reference: A unique book identifier (ISBN, ASIN, or UUID) is required for Amazon KDP publishing. Add <dc:identifier> to your OPF metadata.",
+        r"Enhanced Typesetting": "Reference: Amazon Enhanced Typesetting provides improved typography but is disabled by certain CSS/HTML patterns. See: https://kdp.amazon.com/en_US/help/topic/G202187570",
+        r"KDP REQUIRES a functional TOC": "Reference: Amazon KDP requires a functional, linked table of contents for all e-books.",
+        r"TIFF image": "Reference: TIFF images are not supported by Amazon KDP. Convert to JPEG or PNG before uploading.",
+        r"Fixed font-size units": "Reference: Fixed font sizes (px/pt) prevent users from adjusting text size on Kindle. Use relative units (em, rem, %).",
+        r"not supported by KDP": "Note: Since March 2025, Amazon KDP accepts EPUB directly (MOBI uploads are no longer accepted). Ensure your EPUB meets KDP requirements before uploading."
     }
     
     def log(msg=""):
@@ -1132,6 +1604,10 @@ def print_report(report: Dict, output_file=None):
     log(f"[CSS]     {info['css_count']}")
     if 'font_count' in info:
         log(f"[FONTS]   {info['font_count']}")
+    if info.get('identifier'):
+        log(f"[ID]      {info['identifier']}")
+    if info.get('language'):
+        log(f"[LANG]    {info['language']}")
     
     # Platform-specific reports
     platforms = [
@@ -1140,7 +1616,7 @@ def print_report(report: Dict, output_file=None):
         ('Kobo', 'kobo'),
         ('PocketBook', 'pocketbook'),
         ('InkBook', 'inkbook'),
-        ('Kindle', 'kindle'),
+        ('Amazon KDP', 'kindle'),
         ('Android Readers', 'android')
     ]
     
@@ -1198,7 +1674,12 @@ def print_report(report: Dict, output_file=None):
                 log(f"   [CRITICAL] {issue}")
             log("   [SUGGESTION] Remove CSS transform properties from stylesheet")
             log("   [NOTE] InkBook readers have similar CSS transform issues")
-        
+
+        if critical.get('kindle'):
+            log("\nAMAZON KDP - Publishing May Be Rejected:")
+            for issue in critical['kindle']:
+                log(f"   [CRITICAL] {issue}")
+
         if critical.get('general'):
             log("\nGENERAL - Affects Multiple Readers:")
             for issue in critical['general']:
