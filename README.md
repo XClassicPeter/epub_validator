@@ -67,9 +67,9 @@ python3 epub_validator.py mybook.epub
 ### Example Output
 
 ```
-==================================================
+======================================================================
 EPUB VALIDATION REPORT
-==================================================
+======================================================================
 
 [TITLE]   My Book Title
 [AUTHOR]  Author Name
@@ -78,27 +78,43 @@ EPUB VALIDATION REPORT
 [FILES]   42
 [IMAGES]  15
 [CSS]     3
+[FONTS]   2
+[ID]      urn:uuid:12345-abcde
+[LANG]    en
 
 --- APPLE BOOKS ---
-  [ERROR] OEBPS/chapter1.xhtml (line 198): Undeclared entity 'nbsp' - 
+  [ERROR] OEBPS/chapter1.xhtml (line 198): Undeclared entity 'nbsp' -
           Replace &nbsp; with &#160; or add proper DOCTYPE
      [INFO] Reference: HTML entities like &nbsp; must be declared in XML/XHTML...
 
 --- POCKETBOOK ---
-  [ERROR] OEBPS/styles/main.css (line 45): CSS transform detected 
+  [ERROR] OEBPS/styles/main.css (line 45): CSS transform detected
           (stops rendering on PocketBook/InkBook)
 
-==================================================
+======================================================================
 CRITICAL ISSUES - REQUIRE IMMEDIATE ATTENTION
-==================================================
+======================================================================
 
 APPLE BOOKS - Book Cannot Load Properly:
    [CRITICAL] HTML entity errors prevent full rendering
 
-==================================================
+======================================================================
+EDITOR'S FIX GUIDE (Calibre)
+======================================================================
+
+Open your EPUB in Calibre > Edit Book (Ctrl+E / Cmd+E) to apply fixes.
+After all edits: Tools > Check Book (F7) to verify, then save (Ctrl+S).
+
+1. Undeclared HTML entities (Apple Books)
+   ...step-by-step instructions...
+
+2. CSS transforms (PocketBook / InkBook crash)
+   ...step-by-step instructions...
+
+======================================================================
 SUMMARY: 3 issues, 5 warnings
          1 CRITICAL issues requiring immediate fixes
-==================================================
+======================================================================
 ```
 
 ## Understanding EPUB Format
@@ -236,7 +252,7 @@ Different e-reader platforms have varying levels of EPUB support. Understanding 
 
 **Support Level**: ⭐⭐⭐⭐⭐ Excellent
 
-- **Rendering Engine**: WebKit-based or similar
+- **Rendering Engine**: Calibre uses Qt WebEngine (Chromium-based); Adobe Digital Editions uses its own RMSDK
 - **Strengths**:
   - Full EPUB 3 support
   - Most CSS 3 features work
@@ -343,14 +359,14 @@ Different e-reader platforms have varying levels of EPUB support. Understanding 
 
 ### Amazon KDP (Kindle)
 
-**Support Level**: ⭐⭐⭐⭐ Very Good (EPUB accepted directly since March 2025)
+**Support Level**: ⭐⭐⭐⭐ Very Good
 
-- **Format**: EPUB accepted directly (MOBI uploads no longer accepted as of March 2025)
+- **Format**: EPUB accepted directly (also DOCX, KPF). MOBI no longer accepted — reflowable since August 2021, all formats since March 2025
 - **Tools**: Kindle Previewer, Amazon KDP upload
 - **Rendering Engine**: Custom with Enhanced Typesetting
 - **Cover Requirements**:
   - Minimum: 625x1000px, Ideal: 1600x2560px, Maximum: 10000px
-  - Format: JPEG or PNG only (no TIFF, no CMYK)
+  - Format: JPEG or PNG (JPEG preferred by KDP). CMYK not supported — use sRGB
 - **Required Metadata**: dc:identifier (ISBN/ASIN/UUID), dc:title, dc:language
 - **Limitations**:
   - WOFF/WOFF2 fonts not supported (use TTF/OTF)
@@ -394,25 +410,26 @@ Different e-reader platforms have varying levels of EPUB support. Understanding 
 
 **E-ink Displays** (PocketBook, InkBook, Kindle, Kobo e-readers):
 - **Characteristics**:
-  - Black & white (or limited grayscale)
-  - Slow refresh rate
+  - Traditional: black & white / grayscale
+  - Color e-ink (since 2024): Kindle Colorsoft, Kobo Libra Colour, PocketBook InkPad Color 3 — use E Ink Kaleido technology with muted color palette (~4096 colors, 150 PPI color / 300 PPI B&W)
+  - Slower refresh rate than LCD
   - Limited processing power
   - Optimized for reading text
 - **Implications**:
   - Animations don't work
   - Complex CSS may be simplified
-  - Color images rendered in grayscale
+  - B&W e-ink renders color images in grayscale; color e-ink shows muted colors
   - Prefer simpler layouts
 
 **LCD/OLED Displays** (Tablets, phones, PC):
 - **Characteristics**:
-  - Full color
+  - Full color, high saturation
   - Fast refresh
   - More processing power
 - **Implications**:
   - Support more complex layouts
   - CSS effects work better
-  - Full color images
+  - Full color images at native quality
   - JavaScript more likely to work
 
 ### Best Practices for Maximum Compatibility
