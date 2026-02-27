@@ -152,7 +152,7 @@ When adding platform-specific checks:
 
 - `pc_reader`: Calibre, Adobe Digital Editions, desktop readers
 - `apple_books`: iOS/macOS Books app
-- `kindle`: Amazon Kindle (requires MOBI conversion)
+- `kindle`: Amazon Kindle / KDP (EPUB accepted directly since March 2025)
 - `kobo`: Kobo e-readers and apps
 - `pocketbook`: PocketBook e-readers
 - `inkbook`: InkBook e-readers

@@ -2,7 +2,7 @@
 
 A comprehensive EPUB validation tool that checks e-book files for compatibility issues across different reading platforms and devices.
 
-[![Version](https://img.shields.io/badge/version-1.5-blue.svg)](https://github.com/XClassicPeter/epub_validator)
+[![Version](https://img.shields.io/badge/version-1.6-blue.svg)](https://github.com/XClassicPeter/epub_validator)
 [![Python](https://img.shields.io/badge/python-3.7+-green.svg)](https://www.python.org/)
 [![License](https://img.shields.io/badge/license-MIT-orange.svg)](LICENSE)
 
@@ -17,8 +17,13 @@ A comprehensive EPUB validation tool that checks e-book files for compatibility 
   - Link validation (internal links, fragment identifiers, broken references)
   - ID uniqueness across documents
   - Metadata validation (required language, cover image)
+  - Language attribute validation (dc:language consistency, BCP 47, content mismatch)
+  - CSS selector validation (invalid HTML element selectors)
+  - Content structure analysis (oversized single-file books)
+  - Placeholder metadata detection
   - Platform-specific issues (CSS transforms on e-ink, entity errors on Apple Books)
 - **Detailed Reports**: Line-by-line error reporting with EPUB specification references
+- **Calibre Fix Guide**: Contextual step-by-step repair instructions for every detected issue
 - **No Dependencies**: Uses only Python standard library
 
 ## Table of Contents
@@ -562,8 +567,6 @@ Contributions are welcome! Please see [CONTRIBUTING.md](CONTRIBUTING.md) for gui
 - Accessibility metadata validation (EPUB Accessibility 1.1)
 - Media overlay validation
 - Semantic inflection (epub:type) validation
-- Font obfuscation validation
-- More comprehensive CSS validation
 - Performance optimizations for large EPUBs
 
 ## License
@@ -594,7 +597,7 @@ MIT License - see [LICENSE](LICENSE) file for details.
 
 ---
 
-**Version**: 1.5
-**Last Updated**: February 22, 2026  
+**Version**: 1.6
+**Last Updated**: February 27, 2026
 **Author**: XClassicPeter  
 **Repository**: https://github.com/XClassicPeter/epub_validator

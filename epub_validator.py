@@ -3,8 +3,8 @@
 EPUB Validator - Assess EPUB files for compatibility issues across different readers
 Supports: Standard PC readers, Apple Books, PocketBook, and Amazon KDP
 
-Version: 1.5
-Last Updated: 2026-02-22
+Version: 1.6
+Last Updated: 2026-02-27
 
 See CHANGELOG.md for version history.
 """
@@ -2085,7 +2085,7 @@ def print_report(report: Dict, output_file=None):
 
     def check_explanation(message):
         for pattern, explanation in EXPLANATIONS.items():
-            if pattern in message and pattern not in shown_explanations:
+            if re.search(pattern, message, re.IGNORECASE) and pattern not in shown_explanations:
                 shown_explanations.add(pattern)
                 log(f"     [INFO] {explanation}")
 

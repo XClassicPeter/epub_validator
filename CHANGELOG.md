@@ -2,6 +2,23 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.6] - 2026-02-27
+
+### Added
+- **Contextual Calibre Fix Guide**: Auto-generated step-by-step repair instructions appended to every report, covering 18 issue types (margins, entities, transforms, fonts, links, metadata, etc.)
+- **Language attribute validation**: Checks all dc:language entries, detects conflicting languages, and validates xml:lang/lang attributes in content files against declared metadata
+- **CSS selector validation**: Detects CSS rules targeting non-existent HTML elements (e.g. `png {}` instead of `img {}`)
+- **Content structure analysis**: Warns about oversized single-file books that should be split into chapters
+- **Placeholder metadata detection**: Flags TODO/FIXME/placeholder values in dc:source, dc:identifier, dc:publisher, dc:rights
+- **Empty href detection**: Identifies broken/placeholder `href=""` links in content files
+- **URL-decoded manifest paths**: Properly handles percent-encoded filenames in OPF manifest (fixes file-not-found false positives for non-ASCII filenames)
+- New EXPLANATIONS for: conflicting languages, lang mismatches, empty hrefs, placeholder metadata, invalid CSS selectors, content splitting, CMYK images
+
+### Fixed
+- False positive: manifest file references with URL-encoded characters (e.g. spaces as `%20`) now resolve correctly
+- EXPLANATIONS pattern matching now uses regex instead of literal substring for reliable info display
+- Removed "font obfuscation validation" and "more comprehensive CSS validation" from README improvement areas (now implemented)
+
 ## [1.5] - 2026-02-22
 
 ### Added
